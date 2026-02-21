@@ -1,0 +1,426 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestSanitizeRepoPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "simple", input: "shell/.zshrc", want: "shell/.zshrc"},
+		{name: "trims whitespace", input: "  nvim/init.lua  ", want: "nvim/init.lua"},
+		{name: "normalizes dots", input: "a/./b/../c", want: "a/c"},
+		{name: "rejects empty", input: "", wantErr: true},
+		{name: "rejects parent", input: "../x", wantErr: true},
+		{name: "rejects absolute", input: "/etc/passwd", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sanitizeRepoPath(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.input)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if got != tc.want {
+				t.Fatalf("sanitizeRepoPath(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExpandPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("failed to get home dir: %v", err)
+	}
+
+	t.Run("expands tilde", func(t *testing.T) {
+		got, err := expandPath("~/.config", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := filepath.Join(home, ".config")
+		if got != want {
+			t.Fatalf("expandPath returned %q, want %q", got, want)
+		}
+	})
+
+	t.Run("expands DOTFILES override", func(t *testing.T) {
+		dotfiles := filepath.Join(t.TempDir(), "mydotfiles")
+		got, err := expandPath("$DOTFILES/shell/.zshrc", dotfiles)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		want := filepath.Join(dotfiles, "shell", ".zshrc")
+		if got != want {
+			t.Fatalf("expandPath returned %q, want %q", got, want)
+		}
+	})
+
+	t.Run("rejects unsupported tilde form", func(t *testing.T) {
+		if _, err := expandPath("~other/file", ""); err == nil {
+			t.Fatalf("expected error for unsupported tilde form")
+		}
+	})
+}
+
+func TestParseMap(t *testing.T) {
+	dotfiles := t.TempDir()
+	mapPath := filepath.Join(dotfiles, mapFileName)
+
+	content := strings.Join([]string{
+		"# shell",
+		"",
+		"shell/.zshrc : ~/.zshrc",
+		"nvim/init.lua : ~/.config/nvim/init.lua",
+	}, "\n") + "\n"
+
+	if err := os.WriteFile(mapPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write map file: %v", err)
+	}
+
+	mappings, err := parseMap(mapPath, dotfiles)
+	if err != nil {
+		t.Fatalf("parseMap returned error: %v", err)
+	}
+
+	if len(mappings) != 2 {
+		t.Fatalf("expected 2 mappings, got %d", len(mappings))
+	}
+
+	if mappings[0].RepoRel != "shell/.zshrc" {
+		t.Fatalf("unexpected first RepoRel: %q", mappings[0].RepoRel)
+	}
+
+	if mappings[0].SystemRaw != "~/.zshrc" {
+		t.Fatalf("unexpected first SystemRaw: %q", mappings[0].SystemRaw)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("failed to get home dir: %v", err)
+	}
+
+	wantSystemAbs := filepath.Join(home, ".zshrc")
+	if mappings[0].SystemAbs != wantSystemAbs {
+		t.Fatalf("unexpected first SystemAbs: %q (want %q)", mappings[0].SystemAbs, wantSystemAbs)
+	}
+
+	t.Run("invalid line returns error", func(t *testing.T) {
+		badPath := filepath.Join(dotfiles, "bad.map")
+		if err := os.WriteFile(badPath, []byte("invalid-line\n"), 0o644); err != nil {
+			t.Fatalf("failed to write bad map: %v", err)
+		}
+
+		if _, err := parseMap(badPath, dotfiles); err == nil {
+			t.Fatalf("expected parse error for invalid line")
+		}
+	})
+}
+
+func TestSymlinkPointsTo(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatalf("failed to create target file: %v", err)
+	}
+
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("target.txt", link); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	ok, err := symlinkPointsTo(link, target)
+	if err != nil {
+		t.Fatalf("symlinkPointsTo returned error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected symlink to point to target")
+	}
+
+	other := filepath.Join(dir, "other.txt")
+	if err := os.WriteFile(other, []byte("y"), 0o644); err != nil {
+		t.Fatalf("failed to create other file: %v", err)
+	}
+
+	ok, err = symlinkPointsTo(link, other)
+	if err != nil {
+		t.Fatalf("symlinkPointsTo returned error: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected symlink not to point to other target")
+	}
+}
+
+func TestMappingStatus(t *testing.T) {
+	t.Run("MISSING", func(t *testing.T) {
+		dotfiles := t.TempDir()
+		systemPath := filepath.Join(dotfiles, "home", ".zshrc")
+		m := mapping{RepoRel: "shell/.zshrc", SystemRaw: systemPath, SystemAbs: systemPath}
+
+		got, err := mappingStatus(dotfiles, m)
+		if err != nil {
+			t.Fatalf("mappingStatus error: %v", err)
+		}
+		if got != "MISSING" {
+			t.Fatalf("got %q, want MISSING", got)
+		}
+	})
+
+	t.Run("STRAY regular file", func(t *testing.T) {
+		dotfiles := t.TempDir()
+		systemPath := filepath.Join(dotfiles, "home", ".zshrc")
+		if err := os.MkdirAll(filepath.Dir(systemPath), 0o755); err != nil {
+			t.Fatalf("mkdir failed: %v", err)
+		}
+		if err := os.WriteFile(systemPath, []byte("stray"), 0o644); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+
+		m := mapping{RepoRel: "shell/.zshrc", SystemRaw: systemPath, SystemAbs: systemPath}
+		got, err := mappingStatus(dotfiles, m)
+		if err != nil {
+			t.Fatalf("mappingStatus error: %v", err)
+		}
+		if got != "STRAY" {
+			t.Fatalf("got %q, want STRAY", got)
+		}
+	})
+
+	t.Run("BROKEN", func(t *testing.T) {
+		dotfiles := t.TempDir()
+		repoRel := "shell/.zshrc"
+		repoAbs := repoAbsPath(dotfiles, repoRel)
+		systemPath := filepath.Join(dotfiles, "home", ".zshrc")
+
+		if err := os.MkdirAll(filepath.Dir(systemPath), 0o755); err != nil {
+			t.Fatalf("mkdir failed: %v", err)
+		}
+		if err := os.Symlink(repoAbs, systemPath); err != nil {
+			t.Fatalf("symlink failed: %v", err)
+		}
+
+		m := mapping{RepoRel: repoRel, SystemRaw: systemPath, SystemAbs: systemPath}
+		got, err := mappingStatus(dotfiles, m)
+		if err != nil {
+			t.Fatalf("mappingStatus error: %v", err)
+		}
+		if got != "BROKEN" {
+			t.Fatalf("got %q, want BROKEN", got)
+		}
+	})
+
+	t.Run("OK", func(t *testing.T) {
+		dotfiles := t.TempDir()
+		repoRel := "shell/.zshrc"
+		repoAbs := repoAbsPath(dotfiles, repoRel)
+		systemPath := filepath.Join(dotfiles, "home", ".zshrc")
+
+		if err := os.MkdirAll(filepath.Dir(repoAbs), 0o755); err != nil {
+			t.Fatalf("mkdir repo failed: %v", err)
+		}
+		if err := os.WriteFile(repoAbs, []byte("ok"), 0o644); err != nil {
+			t.Fatalf("write repo file failed: %v", err)
+		}
+
+		if err := os.MkdirAll(filepath.Dir(systemPath), 0o755); err != nil {
+			t.Fatalf("mkdir system failed: %v", err)
+		}
+		if err := os.Symlink(repoAbs, systemPath); err != nil {
+			t.Fatalf("symlink failed: %v", err)
+		}
+
+		m := mapping{RepoRel: repoRel, SystemRaw: systemPath, SystemAbs: systemPath}
+		got, err := mappingStatus(dotfiles, m)
+		if err != nil {
+			t.Fatalf("mappingStatus error: %v", err)
+		}
+		if got != "OK" {
+			t.Fatalf("got %q, want OK", got)
+		}
+	})
+}
+
+func TestAppendMapping(t *testing.T) {
+	dir := t.TempDir()
+	mapPath := filepath.Join(dir, mapFileName)
+
+	if err := appendMapping(mapPath, "shell/.zshrc", "~/.zshrc"); err != nil {
+		t.Fatalf("appendMapping first call failed: %v", err)
+	}
+	if err := appendMapping(mapPath, "nvim/init.lua", "~/.config/nvim/init.lua"); err != nil {
+		t.Fatalf("appendMapping second call failed: %v", err)
+	}
+
+	data, err := os.ReadFile(mapPath)
+	if err != nil {
+		t.Fatalf("failed to read map file: %v", err)
+	}
+
+	text := string(data)
+	if !strings.Contains(text, "shell/.zshrc : ~/.zshrc\n") {
+		t.Fatalf("missing first mapping in map file: %q", text)
+	}
+	if !strings.Contains(text, "nvim/init.lua : ~/.config/nvim/init.lua\n") {
+		t.Fatalf("missing second mapping in map file: %q", text)
+	}
+}
+
+func TestIntegrationTrackAndLink(t *testing.T) {
+	root, err := os.MkdirTemp("", "dot-integration-")
+	if err != nil {
+		t.Fatalf("failed to create temp root: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(root)
+	}()
+
+	dotfilesDir := filepath.Join(root, "dotfiles")
+	homeDir := filepath.Join(root, "home")
+	systemFile := filepath.Join(homeDir, ".bashrc")
+
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatalf("failed to create temp home dir: %v", err)
+	}
+
+	originalContent := []byte("export TEST_VAR=1\n")
+	if err := os.WriteFile(systemFile, originalContent, 0o644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	if err := cmdTrack(dotfilesDir, []string{systemFile, "shell/.bashrc"}); err != nil {
+		t.Fatalf("cmdTrack failed: %v", err)
+	}
+
+	repoFile := filepath.Join(dotfilesDir, "shell", ".bashrc")
+
+	repoData, err := os.ReadFile(repoFile)
+	if err != nil {
+		t.Fatalf("failed to read tracked repo file: %v", err)
+	}
+	if string(repoData) != string(originalContent) {
+		t.Fatalf("repo file content mismatch: got %q, want %q", string(repoData), string(originalContent))
+	}
+
+	ok, err := symlinkPointsTo(systemFile, repoFile)
+	if err != nil {
+		t.Fatalf("failed to inspect created symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("system file symlink does not point to repo file")
+	}
+
+	if err := os.Remove(systemFile); err != nil {
+		t.Fatalf("failed to remove symlink before relink test: %v", err)
+	}
+
+	if err := cmdLink(dotfilesDir); err != nil {
+		t.Fatalf("cmdLink failed: %v", err)
+	}
+
+	ok, err = symlinkPointsTo(systemFile, repoFile)
+	if err != nil {
+		t.Fatalf("failed to inspect relinked symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("relinked system file does not point to repo file")
+	}
+
+	mapPath := filepath.Join(dotfilesDir, mapFileName)
+	mapData, err := os.ReadFile(mapPath)
+	if err != nil {
+		t.Fatalf("failed to read map file: %v", err)
+	}
+
+	if !strings.Contains(string(mapData), "shell/.bashrc : ") {
+		t.Fatalf("map file is missing track entry: %q", string(mapData))
+	}
+}
+
+func TestIntegrationTrackDirectoryAndLink(t *testing.T) {
+	root, err := os.MkdirTemp("", "dot-dir-integration-")
+	if err != nil {
+		t.Fatalf("failed to create temp root: %v", err)
+	}
+	defer func() {
+		_ = os.RemoveAll(root)
+	}()
+
+	dotfilesDir := filepath.Join(root, "dotfiles")
+	homeDir := filepath.Join(root, "home")
+	systemDir := filepath.Join(homeDir, ".config", "nvim")
+	nestedSystemFile := filepath.Join(systemDir, "lua", "plugins.lua")
+
+	if err := os.MkdirAll(filepath.Dir(nestedSystemFile), 0o755); err != nil {
+		t.Fatalf("failed to create nested source directory: %v", err)
+	}
+
+	originalContent := []byte("return {}\n")
+	if err := os.WriteFile(nestedSystemFile, originalContent, 0o644); err != nil {
+		t.Fatalf("failed to create nested source file: %v", err)
+	}
+
+	if err := cmdTrack(dotfilesDir, []string{systemDir, "nvim"}); err != nil {
+		t.Fatalf("cmdTrack failed for directory: %v", err)
+	}
+
+	repoDir := filepath.Join(dotfilesDir, "nvim")
+	repoNestedFile := filepath.Join(repoDir, "lua", "plugins.lua")
+
+	repoData, err := os.ReadFile(repoNestedFile)
+	if err != nil {
+		t.Fatalf("failed to read tracked nested repo file: %v", err)
+	}
+	if string(repoData) != string(originalContent) {
+		t.Fatalf("repo nested file content mismatch: got %q, want %q", string(repoData), string(originalContent))
+	}
+
+	ok, err := symlinkPointsTo(systemDir, repoDir)
+	if err != nil {
+		t.Fatalf("failed to inspect created directory symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("system directory symlink does not point to repo directory")
+	}
+
+	throughLinkData, err := os.ReadFile(filepath.Join(systemDir, "lua", "plugins.lua"))
+	if err != nil {
+		t.Fatalf("failed to read nested file through symlink: %v", err)
+	}
+	if string(throughLinkData) != string(originalContent) {
+		t.Fatalf("nested file through symlink mismatch: got %q, want %q", string(throughLinkData), string(originalContent))
+	}
+
+	if err := os.Remove(systemDir); err != nil {
+		t.Fatalf("failed to remove directory symlink before relink test: %v", err)
+	}
+
+	if err := cmdLink(dotfilesDir); err != nil {
+		t.Fatalf("cmdLink failed for directory mapping: %v", err)
+	}
+
+	ok, err = symlinkPointsTo(systemDir, repoDir)
+	if err != nil {
+		t.Fatalf("failed to inspect relinked directory symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("relinked system directory does not point to repo directory")
+	}
+}
