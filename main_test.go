@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -283,6 +284,41 @@ func TestAppendMapping(t *testing.T) {
 	}
 }
 
+func TestParseGlobalOptions(t *testing.T) {
+	t.Run("parses simulate flag", func(t *testing.T) {
+		options, args := parseGlobalOptions([]string{"--simulate", "track", "~/.bashrc"})
+		if !options.Simulate {
+			t.Fatalf("expected simulate option to be true")
+		}
+
+		if len(args) != 2 || args[0] != "track" || args[1] != "~/.bashrc" {
+			t.Fatalf("unexpected parsed args: %v", args)
+		}
+	})
+
+	t.Run("parses short simulate flag after command", func(t *testing.T) {
+		options, args := parseGlobalOptions([]string{"link", "-n"})
+		if !options.Simulate {
+			t.Fatalf("expected simulate option to be true")
+		}
+
+		if len(args) != 1 || args[0] != "link" {
+			t.Fatalf("unexpected parsed args: %v", args)
+		}
+	})
+
+	t.Run("respects option terminator", func(t *testing.T) {
+		options, args := parseGlobalOptions([]string{"track", "--", "--simulate", "shell/.zshrc"})
+		if options.Simulate {
+			t.Fatalf("expected simulate option to remain false")
+		}
+
+		if len(args) != 3 || args[0] != "track" || args[1] != "--simulate" || args[2] != "shell/.zshrc" {
+			t.Fatalf("unexpected parsed args: %v", args)
+		}
+	})
+}
+
 func TestIntegrationTrackAndLink(t *testing.T) {
 	root, err := os.MkdirTemp("", "dot-integration-")
 	if err != nil {
@@ -351,6 +387,94 @@ func TestIntegrationTrackAndLink(t *testing.T) {
 
 	if !strings.Contains(string(mapData), "shell/.bashrc : ") {
 		t.Fatalf("map file is missing track entry: %q", string(mapData))
+	}
+}
+
+func TestIntegrationSimulateTrack(t *testing.T) {
+	root := t.TempDir()
+	dotfilesDir := filepath.Join(root, "dotfiles")
+	homeDir := filepath.Join(root, "home")
+	systemFile := filepath.Join(homeDir, ".bashrc")
+
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		t.Fatalf("failed to create temp home dir: %v", err)
+	}
+
+	originalContent := []byte("export TEST_VAR=1\n")
+	if err := os.WriteFile(systemFile, originalContent, 0o644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	t.Setenv("DOTFILES", dotfilesDir)
+
+	if err := run([]string{"--simulate", "track", systemFile, "shell/.bashrc"}); err != nil {
+		t.Fatalf("run simulate track failed: %v", err)
+	}
+
+	info, err := os.Lstat(systemFile)
+	if err != nil {
+		t.Fatalf("failed to inspect source file after simulate: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("source file should remain a regular file in simulate mode")
+	}
+
+	data, err := os.ReadFile(systemFile)
+	if err != nil {
+		t.Fatalf("failed to read source file after simulate: %v", err)
+	}
+	if string(data) != string(originalContent) {
+		t.Fatalf("source file content changed in simulate mode: got %q, want %q", string(data), string(originalContent))
+	}
+
+	repoFile := filepath.Join(dotfilesDir, "shell", ".bashrc")
+	if _, err := os.Stat(repoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("repo file should not exist after simulate track, err=%v", err)
+	}
+
+	mapPath := filepath.Join(dotfilesDir, mapFileName)
+	if _, err := os.Stat(mapPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("map file should not exist after simulate track, err=%v", err)
+	}
+}
+
+func TestIntegrationSimulateLink(t *testing.T) {
+	root := t.TempDir()
+	dotfilesDir := filepath.Join(root, "dotfiles")
+	homeDir := filepath.Join(root, "home")
+	systemFile := filepath.Join(homeDir, ".bashrc")
+	repoFile := filepath.Join(dotfilesDir, "shell", ".bashrc")
+
+	if err := os.MkdirAll(filepath.Dir(repoFile), 0o755); err != nil {
+		t.Fatalf("failed to create repo directory: %v", err)
+	}
+	if err := os.WriteFile(repoFile, []byte("content\n"), 0o644); err != nil {
+		t.Fatalf("failed to write repo file: %v", err)
+	}
+
+	mapPath := filepath.Join(dotfilesDir, mapFileName)
+	mapContent := "shell/.bashrc : " + systemFile + "\n"
+	if err := os.WriteFile(mapPath, []byte(mapContent), 0o644); err != nil {
+		t.Fatalf("failed to write map file: %v", err)
+	}
+
+	t.Setenv("DOTFILES", dotfilesDir)
+
+	if err := run([]string{"link", "--simulate"}); err != nil {
+		t.Fatalf("run simulate link failed: %v", err)
+	}
+
+	if _, err := os.Lstat(systemFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("system file should not be created in simulate mode, err=%v", err)
+	}
+}
+
+func TestIntegrationSimulateSync(t *testing.T) {
+	dotfilesDir := t.TempDir()
+	t.Setenv("DOTFILES", dotfilesDir)
+
+	if err := run([]string{"--simulate", "sync"}); err != nil {
+		t.Fatalf("run simulate sync failed: %v", err)
 	}
 }
 

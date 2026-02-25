@@ -21,6 +21,10 @@ type mapping struct {
 	Line      int
 }
 
+type globalOptions struct {
+	Simulate bool
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "dot: %v\n", err)
@@ -29,7 +33,9 @@ func main() {
 }
 
 func run(args []string) error {
-	if len(args) == 0 {
+	options, commandArgs := parseGlobalOptions(args)
+
+	if len(commandArgs) == 0 {
 		printUsage()
 		return nil
 	}
@@ -39,34 +45,63 @@ func run(args []string) error {
 		return fmt.Errorf("resolve DOTFILES: %w", err)
 	}
 
-	switch args[0] {
+	switch commandArgs[0] {
 	case "track":
-		return cmdTrack(dotfilesDir, args[1:])
+		return cmdTrackWithSimulate(dotfilesDir, commandArgs[1:], options.Simulate)
 	case "link":
-		if len(args) != 1 {
+		if len(commandArgs) != 1 {
 			return errors.New("usage: dot link")
 		}
-		return cmdLink(dotfilesDir)
+		return cmdLinkWithSimulate(dotfilesDir, options.Simulate)
 	case "list":
-		if len(args) != 1 {
+		if len(commandArgs) != 1 {
 			return errors.New("usage: dot list")
 		}
 		return cmdList(dotfilesDir)
 	case "sync":
-		if len(args) != 1 {
+		if len(commandArgs) != 1 {
 			return errors.New("usage: dot sync")
 		}
-		return cmdSync(dotfilesDir)
+		return cmdSyncWithSimulate(dotfilesDir, options.Simulate)
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
 	default:
 		printUsage()
-		return fmt.Errorf("unknown command: %s", args[0])
+		return fmt.Errorf("unknown command: %s", commandArgs[0])
 	}
 }
 
+func parseGlobalOptions(args []string) (globalOptions, []string) {
+	options := globalOptions{}
+	commandArgs := make([]string, 0, len(args))
+	parsingOptions := true
+
+	for _, arg := range args {
+		if parsingOptions && arg == "--" {
+			parsingOptions = false
+			continue
+		}
+
+		if parsingOptions {
+			switch arg {
+			case "-n", "--simulate":
+				options.Simulate = true
+				continue
+			}
+		}
+
+		commandArgs = append(commandArgs, arg)
+	}
+
+	return options, commandArgs
+}
+
 func cmdTrack(dotfilesDir string, args []string) error {
+	return cmdTrackWithSimulate(dotfilesDir, args, false)
+}
+
+func cmdTrackWithSimulate(dotfilesDir string, args []string, simulate bool) error {
 	if len(args) < 1 || len(args) > 2 {
 		return errors.New("usage: dot track <file> [target_path]")
 	}
@@ -134,6 +169,24 @@ func cmdTrack(dotfilesDir string, args []string) error {
 		return fmt.Errorf("inspect target_path: %w", statErr)
 	}
 
+	if simulate {
+		parentDir := filepath.Dir(repoAbs)
+		if info, err := os.Stat(parentDir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				fmt.Printf("Simulate: would create directory %s\n", parentDir)
+			} else {
+				return fmt.Errorf("inspect target_path directory: %w", err)
+			}
+		} else if !info.IsDir() {
+			return fmt.Errorf("target_path directory is not a directory: %s", parentDir)
+		}
+
+		fmt.Printf("Simulate: would move %s -> %s\n", sourceAbs, repoAbs)
+		fmt.Printf("Simulate: would create symlink %s -> %s\n", sourceAbs, repoAbs)
+		fmt.Printf("Simulate: would append mapping %s : %s\n", repoRel, compressHome(sourceAbs))
+		return nil
+	}
+
 	if err := os.MkdirAll(filepath.Dir(repoAbs), 0o755); err != nil {
 		return fmt.Errorf("create target_path directory: %w", err)
 	}
@@ -172,6 +225,10 @@ func cmdTrack(dotfilesDir string, args []string) error {
 }
 
 func cmdLink(dotfilesDir string) error {
+	return cmdLinkWithSimulate(dotfilesDir, false)
+}
+
+func cmdLinkWithSimulate(dotfilesDir string, simulate bool) error {
 	mapPath := filepath.Join(dotfilesDir, mapFileName)
 	mappings, err := parseMap(mapPath, dotfilesDir)
 	if err != nil {
@@ -197,12 +254,32 @@ func cmdLink(dotfilesDir string) error {
 			}
 
 			conflicts++
-			fmt.Fprintf(os.Stderr, "Warning: conflict at %s (manual resolution required)\n", m.SystemAbs)
+			if simulate {
+				fmt.Fprintf(os.Stderr, "Simulate: conflict at %s (manual resolution required)\n", m.SystemAbs)
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: conflict at %s (manual resolution required)\n", m.SystemAbs)
+			}
 			continue
 		}
 
 		if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("inspect %s: %w", m.SystemAbs, err)
+		}
+
+		if simulate {
+			parentDir := filepath.Dir(m.SystemAbs)
+			if info, err := os.Stat(parentDir); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					fmt.Printf("Simulate: would create directory %s\n", parentDir)
+				} else {
+					return fmt.Errorf("inspect parent directory for %s: %w", m.SystemAbs, err)
+				}
+			} else if !info.IsDir() {
+				return fmt.Errorf("parent directory path is not a directory: %s", parentDir)
+			}
+
+			fmt.Printf("Simulate: would link %s -> %s\n", m.SystemAbs, repoAbs)
+			continue
 		}
 
 		if err := os.MkdirAll(filepath.Dir(m.SystemAbs), 0o755); err != nil {
@@ -217,7 +294,11 @@ func cmdLink(dotfilesDir string) error {
 	}
 
 	if conflicts > 0 {
-		fmt.Fprintf(os.Stderr, "Skipped %d conflict(s).\n", conflicts)
+		if simulate {
+			fmt.Fprintf(os.Stderr, "Simulate: would skip %d conflict(s).\n", conflicts)
+		} else {
+			fmt.Fprintf(os.Stderr, "Skipped %d conflict(s).\n", conflicts)
+		}
 	}
 
 	return nil
@@ -248,6 +329,18 @@ func cmdList(dotfilesDir string) error {
 }
 
 func cmdSync(dotfilesDir string) error {
+	return cmdSyncWithSimulate(dotfilesDir, false)
+}
+
+func cmdSyncWithSimulate(dotfilesDir string, simulate bool) error {
+	if simulate {
+		fmt.Println("Simulate: would run git add .")
+		fmt.Println("Simulate: would prompt for commit message")
+		fmt.Println("Simulate: would run git commit -m <message>")
+		fmt.Println("Simulate: would run git push")
+		return nil
+	}
+
 	if err := runCommand(dotfilesDir, "git", "add", "."); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
@@ -635,10 +728,13 @@ func printUsage() {
 	fmt.Println("dot - minimalist dotfile manager")
 	fmt.Println("")
 	fmt.Println("usage:")
-	fmt.Println("  dot track <file> [target_path]")
-	fmt.Println("  dot link")
-	fmt.Println("  dot list")
-	fmt.Println("  dot sync")
+	fmt.Println("  dot [--simulate|-n] track <file> [target_path]")
+	fmt.Println("  dot [--simulate|-n] link")
+	fmt.Println("  dot [--simulate|-n] list")
+	fmt.Println("  dot [--simulate|-n] sync")
+	fmt.Println("")
+	fmt.Println("Options:")
+	fmt.Println("  -n, --simulate  Dry run; print actions without making changes")
 	fmt.Println("")
 	fmt.Println("Environment:")
 	fmt.Println("  DOTFILES  Repository path (default: ~/.dotfiles)")
