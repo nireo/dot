@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -19,6 +20,8 @@ const (
 	localIgnoreFileName  = ".dot-local-ignore"
 	compatIgnoreFileName = ".stow-local-ignore"
 )
+
+var errWalkDone = errors.New("walk done")
 
 type mapping struct {
 	RepoRel   string
@@ -53,28 +56,21 @@ func run(args []string) error {
 	switch args[0] {
 	case "track":
 		return cmdTrack(dotfilesDir, args[1:])
-	case "link":
-		if len(args) != 1 {
-			return errors.New("usage: dot link")
-		}
-		return cmdLink(dotfilesDir)
-	case "list":
-		if len(args) != 1 {
-			return errors.New("usage: dot list")
-		}
-		return cmdList(dotfilesDir)
-	case "sync":
-		if len(args) != 1 {
-			return errors.New("usage: dot sync")
-		}
-		return cmdSync(dotfilesDir)
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
-	default:
+	}
+
+	cmds := map[string]func(string) error{"link": cmdLink, "list": cmdList, "sync": cmdSync}
+	cmd, ok := cmds[args[0]]
+	if !ok {
 		printUsage()
 		return fmt.Errorf("unknown command: %s", args[0])
 	}
+	if len(args) != 1 {
+		return fmt.Errorf("usage: dot %s", args[0])
+	}
+	return cmd(dotfilesDir)
 }
 
 func cmdTrack(dotfilesDir string, args []string) error {
@@ -103,17 +99,13 @@ func cmdTrack(dotfilesDir string, args []string) error {
 		return fmt.Errorf("source path must be a regular file or directory: %s", sourceAbs)
 	}
 
-	repoRel := ""
+	repoArg, repoLabel := filepath.Base(sourceAbs), "source file name"
 	if len(args) == 2 {
-		repoRel, err = sanitizeRepoPath(args[1])
-		if err != nil {
-			return fmt.Errorf("invalid target_path: %w", err)
-		}
-	} else {
-		repoRel, err = sanitizeRepoPath(filepath.Base(sourceAbs))
-		if err != nil {
-			return fmt.Errorf("invalid source file name: %w", err)
-		}
+		repoArg, repoLabel = args[1], "target_path"
+	}
+	repoRel, err := sanitizeRepoPath(repoArg)
+	if err != nil {
+		return fmt.Errorf("invalid %s: %w", repoLabel, err)
 	}
 
 	mapPath := filepath.Join(dotfilesDir, mapFileName)
@@ -154,38 +146,20 @@ func cmdTrack(dotfilesDir string, args []string) error {
 	}
 
 	if _, err := os.Stat(repoAbs); err != nil {
-		rollbackErr := movePath(repoAbs, sourceAbs)
-		if rollbackErr != nil {
-			return fmt.Errorf("move verification failed (%v) and rollback failed (%v)", err, rollbackErr)
-		}
-		return fmt.Errorf("move verification failed: %w", err)
+		return rollbackTrack(repoAbs, sourceAbs, err, "move verification failed", nil)
 	}
 
-	ignoreMatcher, err := ignoreMatcherForDir(repoAbs, info)
+	ignoreMatcher, err := ignoreMatcherForPath(repoAbs, info)
 	if err != nil {
-		rollbackErr := movePath(repoAbs, sourceAbs)
-		if rollbackErr != nil {
-			return fmt.Errorf("load ignore file failed (%v) and rollback failed (%v)", err, rollbackErr)
-		}
-		return err
+		return rollbackTrack(repoAbs, sourceAbs, err, "load ignore file failed", nil)
 	}
 
 	if err := linkTrackedPath(repoAbs, sourceAbs, ignoreMatcher); err != nil {
-		removeErr := os.RemoveAll(sourceAbs)
-		rollbackErr := movePath(repoAbs, sourceAbs)
-		if rollbackErr != nil {
-			return fmt.Errorf("create symlink failed (%v), rollback remove link layout (%v), rollback move file (%v)", err, removeErr, rollbackErr)
-		}
-		return fmt.Errorf("create symlink: %w", err)
+		return rollbackTrack(repoAbs, sourceAbs, err, "create symlink failed", func() error { return os.RemoveAll(sourceAbs) })
 	}
 
 	if err := appendMapping(mapPath, repoRel, compressHome(sourceAbs)); err != nil {
-		removeErr := os.RemoveAll(sourceAbs)
-		rollbackErr := movePath(repoAbs, sourceAbs)
-		if removeErr != nil || rollbackErr != nil {
-			return fmt.Errorf("write map failed (%v), rollback remove symlink (%v), rollback move file (%v)", err, removeErr, rollbackErr)
-		}
-		return fmt.Errorf("write map: %w", err)
+		return rollbackTrack(repoAbs, sourceAbs, err, "write map failed", func() error { return os.RemoveAll(sourceAbs) })
 	}
 
 	fmt.Printf("Tracked %s -> %s\n", sourceAbs, repoRel)
@@ -193,8 +167,7 @@ func cmdTrack(dotfilesDir string, args []string) error {
 }
 
 func cmdLink(dotfilesDir string) error {
-	mapPath := filepath.Join(dotfilesDir, mapFileName)
-	mappings, err := parseMap(mapPath, dotfilesDir)
+	mappings, mapPath, err := loadMappings(dotfilesDir)
 	if err != nil {
 		return err
 	}
@@ -221,8 +194,7 @@ func cmdLink(dotfilesDir string) error {
 }
 
 func cmdList(dotfilesDir string) error {
-	mapPath := filepath.Join(dotfilesDir, mapFileName)
-	mappings, err := parseMap(mapPath, dotfilesDir)
+	mappings, mapPath, err := loadMappings(dotfilesDir)
 	if err != nil {
 		return err
 	}
@@ -268,22 +240,25 @@ func cmdSync(dotfilesDir string) error {
 	return nil
 }
 
+func loadMappings(dotfilesDir string) ([]mapping, string, error) {
+	mapPath := filepath.Join(dotfilesDir, mapFileName)
+	mappings, err := parseMap(mapPath, dotfilesDir)
+	return mappings, mapPath, err
+}
+
 func parseMap(mapPath, dotfilesDir string) ([]mapping, error) {
-	f, err := os.Open(mapPath)
+	data, err := os.ReadFile(mapPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("open map file %s: %w", mapPath, err)
 	}
-	defer f.Close()
 
 	var mappings []mapping
-	scanner := bufio.NewScanner(f)
-	lineNumber := 0
-	for scanner.Scan() {
+	for lineNumber, line := range strings.Split(string(data), "\n") {
 		lineNumber++
-		line := strings.TrimSpace(scanner.Text())
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -310,10 +285,6 @@ func parseMap(mapPath, dotfilesDir string) ([]mapping, error) {
 			SystemAbs: systemAbs,
 			Line:      lineNumber,
 		})
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read map file %s: %w", mapPath, err)
 	}
 
 	return mappings, nil
@@ -355,43 +326,14 @@ func appendMapping(mapPath, repoRel, systemPath string) error {
 
 func mappingStatus(dotfilesDir string, m mapping) (string, error) {
 	repoAbs := repoAbsPath(dotfilesDir, m.RepoRel)
-	ignoreMatcher, err := ignoreMatcherForExistingPath(repoAbs)
+	ignoreMatcher, err := ignoreMatcherForPath(repoAbs, nil)
 	if err != nil {
 		return "", err
 	}
 	if ignoreMatcher != nil {
 		return mappingStatusWithIgnore(repoAbs, m.SystemAbs, ignoreMatcher)
 	}
-
-	info, err := os.Lstat(m.SystemAbs)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "MISSING", nil
-		}
-		return "", err
-	}
-
-	if info.Mode()&os.ModeSymlink == 0 {
-		return "STRAY", nil
-	}
-
-	pointsToRepo, err := symlinkPointsTo(m.SystemAbs, repoAbs)
-	if err != nil {
-		return "", err
-	}
-
-	if !pointsToRepo {
-		return "STRAY", nil
-	}
-
-	if _, err := os.Stat(repoAbs); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "BROKEN", nil
-		}
-		return "", err
-	}
-
-	return "OK", nil
+	return symlinkStatus(m.SystemAbs, repoAbs)
 }
 
 func repoAbsPath(dotfilesDir, repoRel string) string {
@@ -415,43 +357,32 @@ func symlinkPointsTo(linkPath, expectedTarget string) (bool, error) {
 }
 
 func linkTrackedPath(repoAbs, systemAbs string, ignoreMatcher *ignoreMatcher) error {
-	if ignoreMatcher != nil {
-		_, err := linkIgnoredDirectory(repoAbs, systemAbs, ignoreMatcher)
-		return err
+	if ignoreMatcher == nil {
+		return os.Symlink(repoAbs, systemAbs)
 	}
-
-	if err := os.Symlink(repoAbs, systemAbs); err != nil {
-		return err
-	}
-
-	return nil
+	_, err := linkIgnoredDirectory(repoAbs, systemAbs, ignoreMatcher)
+	return err
 }
 
 func linkMapping(dotfilesDir string, m mapping) (int, error) {
 	repoAbs := repoAbsPath(dotfilesDir, m.RepoRel)
-	ignoreMatcher, err := ignoreMatcherForExistingPath(repoAbs)
+	ignoreMatcher, err := ignoreMatcherForPath(repoAbs, nil)
 	if err != nil {
 		return 0, fmt.Errorf("load ignore file for %s: %w", repoAbs, err)
 	}
 	if ignoreMatcher != nil {
 		return linkIgnoredDirectory(repoAbs, m.SystemAbs, ignoreMatcher)
 	}
-
-	info, err := os.Lstat(m.SystemAbs)
-	if err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			pointsToRepo, readErr := symlinkPointsTo(m.SystemAbs, repoAbs)
-			if readErr == nil && pointsToRepo {
-				return 0, nil
-			}
-		}
-
+	exists, ok, err := currentLinkOK(m.SystemAbs, repoAbs)
+	if err != nil {
+		return 0, fmt.Errorf("inspect %s: %w", m.SystemAbs, err)
+	}
+	if ok {
+		return 0, nil
+	}
+	if exists {
 		warnConflict(m.SystemAbs)
 		return 1, nil
-	}
-
-	if !errors.Is(err, os.ErrNotExist) {
-		return 0, fmt.Errorf("inspect %s: %w", m.SystemAbs, err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(m.SystemAbs), 0o755); err != nil {
@@ -472,132 +403,78 @@ func linkIgnoredDirectory(repoDir, systemDir string, ignoreMatcher *ignoreMatche
 		return conflicts, err
 	}
 
-	childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, "", ignoreMatcher)
+	err = walkManagedPaths(repoDir, systemDir, ignoreMatcher, func(repoPath, systemPath string, d fs.DirEntry) error {
+		if d.IsDir() {
+			childConflicts, ready, err := ensureManagedDirectory(repoPath, systemPath)
+			conflicts += childConflicts
+			if err != nil {
+				return err
+			}
+			if !ready {
+				return fs.SkipDir
+			}
+			return nil
+		}
+
+		childConflicts, err := ensureManagedSymlink(repoPath, systemPath)
+		conflicts += childConflicts
+		return err
+	})
 	if err != nil {
 		return conflicts, err
 	}
 
 	fmt.Printf("Linked %s -> %s (ignoring matched entries)\n", systemDir, repoDir)
 
-	return conflicts + childConflicts, nil
+	return conflicts, nil
 }
 
 func ensureManagedDirectory(repoDir, systemDir string) (int, bool, error) {
 	info, err := os.Lstat(systemDir)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return 0, false, fmt.Errorf("inspect %s: %w", systemDir, err)
+	switch {
+	case err == nil:
+		if info.IsDir() {
+			return 0, true, nil
 		}
-
+		if info.Mode()&os.ModeSymlink != 0 {
+			pointsToRepo, readErr := symlinkPointsTo(systemDir, repoDir)
+			if readErr == nil && pointsToRepo {
+				if err := os.Remove(systemDir); err != nil {
+					return 0, false, fmt.Errorf("remove symlink %s: %w", systemDir, err)
+				}
+				if err := os.MkdirAll(systemDir, 0o755); err != nil {
+					return 0, false, fmt.Errorf("create directory %s: %w", systemDir, err)
+				}
+				return 0, true, nil
+			}
+		}
+		warnConflict(systemDir)
+		return 1, false, nil
+	case errors.Is(err, os.ErrNotExist):
 		if err := os.MkdirAll(systemDir, 0o755); err != nil {
 			return 0, false, fmt.Errorf("create directory %s: %w", systemDir, err)
 		}
-
 		return 0, true, nil
+	default:
+		return 0, false, fmt.Errorf("inspect %s: %w", systemDir, err)
 	}
-
-	if info.IsDir() {
-		return 0, true, nil
-	}
-
-	if info.Mode()&os.ModeSymlink != 0 {
-		pointsToRepo, readErr := symlinkPointsTo(systemDir, repoDir)
-		if readErr == nil && pointsToRepo {
-			if err := os.Remove(systemDir); err != nil {
-				return 0, false, fmt.Errorf("remove symlink %s: %w", systemDir, err)
-			}
-
-			if err := os.Mkdir(systemDir, 0o755); err != nil {
-				return 0, false, fmt.Errorf("create directory %s: %w", systemDir, err)
-			}
-
-			return 0, true, nil
-		}
-	}
-
-	warnConflict(systemDir)
-	return 1, false, nil
-}
-
-func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher) (int, error) {
-	sourceDir := repoDir
-	if rel != "" {
-		sourceDir = filepath.Join(repoDir, rel)
-	}
-
-	entries, err := os.ReadDir(sourceDir)
-	if err != nil {
-		return 0, fmt.Errorf("read directory %s: %w", sourceDir, err)
-	}
-
-	conflicts := 0
-	for _, entry := range entries {
-		childRel := entry.Name()
-		if rel != "" {
-			childRel = filepath.Join(rel, entry.Name())
-		}
-
-		if ignoreMatcher.Match(childRel) {
-			continue
-		}
-
-		repoPath := filepath.Join(repoDir, childRel)
-		systemPath := filepath.Join(systemDir, childRel)
-		info, err := entry.Info()
-		if err != nil {
-			return conflicts, fmt.Errorf("inspect %s: %w", repoPath, err)
-		}
-
-		if info.IsDir() {
-			dirConflicts, ready, err := ensureManagedDirectory(repoPath, systemPath)
-			if err != nil {
-				return conflicts, err
-			}
-			conflicts += dirConflicts
-			if !ready {
-				continue
-			}
-
-			childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, childRel, ignoreMatcher)
-			if err != nil {
-				return conflicts, err
-			}
-			conflicts += childConflicts
-			continue
-		}
-
-		fileConflicts, err := ensureManagedSymlink(repoPath, systemPath)
-		if err != nil {
-			return conflicts, err
-		}
-		conflicts += fileConflicts
-	}
-
-	return conflicts, nil
 }
 
 func ensureManagedSymlink(repoPath, systemPath string) (int, error) {
-	info, err := os.Lstat(systemPath)
-	if err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
-			pointsToRepo, readErr := symlinkPointsTo(systemPath, repoPath)
-			if readErr == nil && pointsToRepo {
-				return 0, nil
-			}
-		}
-
+	exists, ok, err := currentLinkOK(systemPath, repoPath)
+	if err != nil {
+		return 0, fmt.Errorf("inspect %s: %w", systemPath, err)
+	}
+	if ok {
+		return 0, nil
+	}
+	if exists {
 		warnConflict(systemPath)
 		return 1, nil
 	}
-
-	if !errors.Is(err, os.ErrNotExist) {
-		return 0, fmt.Errorf("inspect %s: %w", systemPath, err)
-	}
-
 	if err := os.Symlink(repoPath, systemPath); err != nil {
 		return 0, fmt.Errorf("create symlink %s: %w", systemPath, err)
 	}
-
 	return 0, nil
 }
 
@@ -605,27 +482,20 @@ func warnConflict(path string) {
 	fmt.Fprintf(os.Stderr, "Warning: conflict at %s (manual resolution required)\n", path)
 }
 
-func ignoreMatcherForDir(path string, info os.FileInfo) (*ignoreMatcher, error) {
-	if info == nil || !info.IsDir() {
-		return nil, nil
-	}
-
-	return loadIgnoreMatcher(path)
-}
-
-func ignoreMatcherForExistingPath(path string) (*ignoreMatcher, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+func ignoreMatcherForPath(path string, info os.FileInfo) (*ignoreMatcher, error) {
+	if info == nil {
+		var err error
+		info, err = os.Lstat(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, nil
+			}
+			return nil, err
 		}
-		return nil, err
 	}
-
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return nil, nil
 	}
-
 	return loadIgnoreMatcher(path)
 }
 
@@ -635,7 +505,7 @@ func loadIgnoreMatcher(packageDir string) (*ignoreMatcher, error) {
 
 	for _, name := range []string{localIgnoreFileName, compatIgnoreFileName} {
 		ignorePath := filepath.Join(packageDir, name)
-		f, err := os.Open(ignorePath)
+		data, err := os.ReadFile(ignorePath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -644,19 +514,15 @@ func loadIgnoreMatcher(packageDir string) (*ignoreMatcher, error) {
 		}
 
 		loaded = true
-		scanner := bufio.NewScanner(f)
-		lineNumber := 0
-		for scanner.Scan() {
-			lineNumber++
-			pattern := stripIgnoreComment(scanner.Text())
+		for lineNumber, line := range strings.Split(string(data), "\n") {
+			pattern := stripIgnoreComment(line)
 			if pattern == "" {
 				continue
 			}
 
 			re, err := regexp.Compile(pattern)
 			if err != nil {
-				f.Close()
-				return nil, fmt.Errorf("invalid ignore pattern at %s:%d: %w", ignorePath, lineNumber, err)
+				return nil, fmt.Errorf("invalid ignore pattern at %s:%d: %w", ignorePath, lineNumber+1, err)
 			}
 
 			if strings.Contains(pattern, "/") {
@@ -664,15 +530,6 @@ func loadIgnoreMatcher(packageDir string) (*ignoreMatcher, error) {
 			} else {
 				matcher.basename = append(matcher.basename, re)
 			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("read ignore file %s: %w", ignorePath, err)
-		}
-
-		if err := f.Close(); err != nil {
-			return nil, fmt.Errorf("close ignore file %s: %w", ignorePath, err)
 		}
 	}
 
@@ -769,81 +626,106 @@ func mappingStatusWithIgnore(repoDir, systemDir string, ignoreMatcher *ignoreMat
 		return "STRAY", nil
 	}
 
-	return ignoredDirectoryStatus(repoDir, systemDir, "", ignoreMatcher)
+	status := "OK"
+	err = walkManagedPaths(repoDir, systemDir, ignoreMatcher, func(repoPath, systemPath string, d fs.DirEntry) error {
+		info, err := os.Lstat(systemPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				status = "MISSING"
+				return errWalkDone
+			}
+			return err
+		}
+
+		if d.IsDir() {
+			if !info.IsDir() {
+				status = "STRAY"
+				return errWalkDone
+			}
+			return nil
+		}
+
+		status, err = symlinkStatus(systemPath, repoPath)
+		if err != nil || status != "OK" {
+			return errOrDone(err, status)
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errWalkDone) {
+		return "", err
+	}
+	return status, nil
 }
 
-func ignoredDirectoryStatus(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher) (string, error) {
-	sourceDir := repoDir
-	if rel != "" {
-		sourceDir = filepath.Join(repoDir, rel)
-	}
+func walkManagedPaths(repoDir, systemDir string, ignoreMatcher *ignoreMatcher, visit func(repoPath, systemPath string, d fs.DirEntry) error) error {
+	return filepath.WalkDir(repoDir, func(repoPath string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(repoDir, repoPath)
+		if err != nil || rel == "." {
+			return err
+		}
+		if ignoreMatcher.Match(rel) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		return visit(repoPath, filepath.Join(systemDir, rel), d)
+	})
+}
 
-	entries, err := os.ReadDir(sourceDir)
+func currentLinkOK(systemPath, repoPath string) (exists, ok bool, err error) {
+	info, err := os.Lstat(systemPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
 	if err != nil {
+		return false, false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return true, false, nil
+	}
+	ok, _ = symlinkPointsTo(systemPath, repoPath)
+	return true, ok, nil
+}
+
+func symlinkStatus(systemPath, repoPath string) (string, error) {
+	info, err := os.Lstat(systemPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "MISSING", nil
+		}
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return "STRAY", nil
+	}
+	ok, err := symlinkPointsTo(systemPath, repoPath)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "STRAY", nil
+	}
+	if _, err := os.Stat(repoPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "BROKEN", nil
 		}
 		return "", err
 	}
-
-	for _, entry := range entries {
-		childRel := entry.Name()
-		if rel != "" {
-			childRel = filepath.Join(rel, entry.Name())
-		}
-
-		if ignoreMatcher.Match(childRel) {
-			continue
-		}
-
-		repoPath := filepath.Join(repoDir, childRel)
-		systemPath := filepath.Join(systemDir, childRel)
-		info, err := entry.Info()
-		if err != nil {
-			return "", err
-		}
-
-		targetInfo, err := os.Lstat(systemPath)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return "MISSING", nil
-			}
-			return "", err
-		}
-
-		if info.IsDir() {
-			if !targetInfo.IsDir() {
-				return "STRAY", nil
-			}
-
-			status, err := ignoredDirectoryStatus(repoDir, systemDir, childRel, ignoreMatcher)
-			if err != nil || status != "OK" {
-				return status, err
-			}
-			continue
-		}
-
-		if targetInfo.Mode()&os.ModeSymlink == 0 {
-			return "STRAY", nil
-		}
-
-		pointsToRepo, err := symlinkPointsTo(systemPath, repoPath)
-		if err != nil {
-			return "", err
-		}
-		if !pointsToRepo {
-			return "STRAY", nil
-		}
-
-		if _, err := os.Stat(repoPath); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return "BROKEN", nil
-			}
-			return "", err
-		}
-	}
-
 	return "OK", nil
+}
+
+func errOrDone(err error, status string) error {
+	if err != nil {
+		return err
+	}
+	if status != "OK" {
+		return errWalkDone
+	}
+	return nil
 }
 
 func movePath(src, dst string) error {
@@ -896,6 +778,18 @@ func movePath(src, dst string) error {
 	}
 
 	return fmt.Errorf("unsupported file type: %s", src)
+}
+
+func rollbackTrack(repoAbs, sourceAbs string, cause error, action string, cleanup func() error) error {
+	var cleanupErr error
+	if cleanup != nil {
+		cleanupErr = cleanup()
+	}
+	moveErr := movePath(repoAbs, sourceAbs)
+	if cleanupErr != nil || moveErr != nil {
+		return fmt.Errorf("%s (%v), cleanup failed (%v), rollback failed (%v)", action, cause, cleanupErr, moveErr)
+	}
+	return fmt.Errorf("%s: %w", action, cause)
 }
 
 func copyDir(src, dst string, perm os.FileMode) error {
@@ -984,8 +878,8 @@ func readCommitMessage() (string, error) {
 }
 
 func resolveDotfilesDir() (string, error) {
-	raw := os.Getenv("DOTFILES")
-	if strings.TrimSpace(raw) == "" {
+	raw := strings.TrimSpace(os.Getenv("DOTFILES"))
+	if raw == "" {
 		raw = "~/.dotfiles"
 	}
 
@@ -1069,14 +963,15 @@ func compressHome(path string) string {
 }
 
 func printUsage() {
-	fmt.Println("dot - minimalist dotfile manager")
-	fmt.Println("")
-	fmt.Println("usage:")
-	fmt.Println("  dot track <file> [target_path]")
-	fmt.Println("  dot link")
-	fmt.Println("  dot list")
-	fmt.Println("  dot sync")
-	fmt.Println("")
-	fmt.Println("Environment:")
-	fmt.Println("  DOTFILES  Repository path (default: ~/.dotfiles)")
+	fmt.Print(`dot - minimalist dotfile manager
+
+usage:
+  dot track <file> [target_path]
+  dot link
+  dot list
+  dot sync
+
+Environment:
+  DOTFILES  Repository path (default: ~/.dotfiles)
+`)
 }
