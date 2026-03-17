@@ -14,19 +14,17 @@ import (
 	"syscall"
 )
 
-const mapFileName = ".dot.map"
-const localIgnoreFileName = ".dot-local-ignore"
-const compatIgnoreFileName = ".stow-local-ignore"
+const (
+	mapFileName          = ".dot.map"
+	localIgnoreFileName  = ".dot-local-ignore"
+	compatIgnoreFileName = ".stow-local-ignore"
+)
 
 type mapping struct {
 	RepoRel   string
 	SystemRaw string
 	SystemAbs string
 	Line      int
-}
-
-type globalOptions struct {
-	Simulate bool
 }
 
 type ignoreMatcher struct {
@@ -42,9 +40,7 @@ func main() {
 }
 
 func run(args []string) error {
-	options, commandArgs := parseGlobalOptions(args)
-
-	if len(commandArgs) == 0 {
+	if len(args) == 0 {
 		printUsage()
 		return nil
 	}
@@ -54,63 +50,34 @@ func run(args []string) error {
 		return fmt.Errorf("resolve DOTFILES: %w", err)
 	}
 
-	switch commandArgs[0] {
+	switch args[0] {
 	case "track":
-		return cmdTrackWithSimulate(dotfilesDir, commandArgs[1:], options.Simulate)
+		return cmdTrack(dotfilesDir, args[1:])
 	case "link":
-		if len(commandArgs) != 1 {
+		if len(args) != 1 {
 			return errors.New("usage: dot link")
 		}
-		return cmdLinkWithSimulate(dotfilesDir, options.Simulate)
+		return cmdLink(dotfilesDir)
 	case "list":
-		if len(commandArgs) != 1 {
+		if len(args) != 1 {
 			return errors.New("usage: dot list")
 		}
 		return cmdList(dotfilesDir)
 	case "sync":
-		if len(commandArgs) != 1 {
+		if len(args) != 1 {
 			return errors.New("usage: dot sync")
 		}
-		return cmdSyncWithSimulate(dotfilesDir, options.Simulate)
+		return cmdSync(dotfilesDir)
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
 	default:
 		printUsage()
-		return fmt.Errorf("unknown command: %s", commandArgs[0])
+		return fmt.Errorf("unknown command: %s", args[0])
 	}
-}
-
-func parseGlobalOptions(args []string) (globalOptions, []string) {
-	options := globalOptions{}
-	commandArgs := make([]string, 0, len(args))
-	parsingOptions := true
-
-	for _, arg := range args {
-		if parsingOptions && arg == "--" {
-			parsingOptions = false
-			continue
-		}
-
-		if parsingOptions {
-			switch arg {
-			case "-n", "--simulate":
-				options.Simulate = true
-				continue
-			}
-		}
-
-		commandArgs = append(commandArgs, arg)
-	}
-
-	return options, commandArgs
 }
 
 func cmdTrack(dotfilesDir string, args []string) error {
-	return cmdTrackWithSimulate(dotfilesDir, args, false)
-}
-
-func cmdTrackWithSimulate(dotfilesDir string, args []string, simulate bool) error {
 	if len(args) < 1 || len(args) > 2 {
 		return errors.New("usage: dot track <file> [target_path]")
 	}
@@ -178,37 +145,6 @@ func cmdTrackWithSimulate(dotfilesDir string, args []string, simulate bool) erro
 		return fmt.Errorf("inspect target_path: %w", statErr)
 	}
 
-	if simulate {
-		parentDir := filepath.Dir(repoAbs)
-		if info, err := os.Stat(parentDir); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				fmt.Printf("Simulate: would create directory %s\n", parentDir)
-			} else {
-				return fmt.Errorf("inspect target_path directory: %w", err)
-			}
-		} else if !info.IsDir() {
-			return fmt.Errorf("target_path directory is not a directory: %s", parentDir)
-		}
-
-		fmt.Printf("Simulate: would move %s -> %s\n", sourceAbs, repoAbs)
-
-		ignoreMatcher, err := ignoreMatcherForDir(sourceAbs, info)
-		if err != nil {
-			return err
-		}
-
-		if ignoreMatcher != nil {
-			if err := simulateIgnoredDirectoryLayout(sourceAbs, sourceAbs, ignoreMatcher); err != nil {
-				return err
-			}
-		} else {
-			fmt.Printf("Simulate: would create symlink %s -> %s\n", sourceAbs, repoAbs)
-		}
-
-		fmt.Printf("Simulate: would append mapping %s : %s\n", repoRel, compressHome(sourceAbs))
-		return nil
-	}
-
 	if err := os.MkdirAll(filepath.Dir(repoAbs), 0o755); err != nil {
 		return fmt.Errorf("create target_path directory: %w", err)
 	}
@@ -234,7 +170,7 @@ func cmdTrackWithSimulate(dotfilesDir string, args []string, simulate bool) erro
 		return err
 	}
 
-	if err := linkTrackedPath(repoAbs, sourceAbs, ignoreMatcher, false); err != nil {
+	if err := linkTrackedPath(repoAbs, sourceAbs, ignoreMatcher); err != nil {
 		removeErr := os.RemoveAll(sourceAbs)
 		rollbackErr := movePath(repoAbs, sourceAbs)
 		if rollbackErr != nil {
@@ -257,10 +193,6 @@ func cmdTrackWithSimulate(dotfilesDir string, args []string, simulate bool) erro
 }
 
 func cmdLink(dotfilesDir string) error {
-	return cmdLinkWithSimulate(dotfilesDir, false)
-}
-
-func cmdLinkWithSimulate(dotfilesDir string, simulate bool) error {
 	mapPath := filepath.Join(dotfilesDir, mapFileName)
 	mappings, err := parseMap(mapPath, dotfilesDir)
 	if err != nil {
@@ -274,7 +206,7 @@ func cmdLinkWithSimulate(dotfilesDir string, simulate bool) error {
 
 	conflicts := 0
 	for _, m := range mappings {
-		mappingConflicts, err := linkMapping(dotfilesDir, m, simulate)
+		mappingConflicts, err := linkMapping(dotfilesDir, m)
 		if err != nil {
 			return err
 		}
@@ -282,11 +214,7 @@ func cmdLinkWithSimulate(dotfilesDir string, simulate bool) error {
 	}
 
 	if conflicts > 0 {
-		if simulate {
-			fmt.Fprintf(os.Stderr, "Simulate: would skip %d conflict(s).\n", conflicts)
-		} else {
-			fmt.Fprintf(os.Stderr, "Skipped %d conflict(s).\n", conflicts)
-		}
+		fmt.Fprintf(os.Stderr, "Skipped %d conflict(s).\n", conflicts)
 	}
 
 	return nil
@@ -317,18 +245,6 @@ func cmdList(dotfilesDir string) error {
 }
 
 func cmdSync(dotfilesDir string) error {
-	return cmdSyncWithSimulate(dotfilesDir, false)
-}
-
-func cmdSyncWithSimulate(dotfilesDir string, simulate bool) error {
-	if simulate {
-		fmt.Println("Simulate: would run git add .")
-		fmt.Println("Simulate: would prompt for commit message")
-		fmt.Println("Simulate: would run git commit -m <message>")
-		fmt.Println("Simulate: would run git push")
-		return nil
-	}
-
 	if err := runCommand(dotfilesDir, "git", "add", "."); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
@@ -498,9 +414,9 @@ func symlinkPointsTo(linkPath, expectedTarget string) (bool, error) {
 	return target == expectedTarget, nil
 }
 
-func linkTrackedPath(repoAbs, systemAbs string, ignoreMatcher *ignoreMatcher, simulate bool) error {
+func linkTrackedPath(repoAbs, systemAbs string, ignoreMatcher *ignoreMatcher) error {
 	if ignoreMatcher != nil {
-		_, err := linkIgnoredDirectory(repoAbs, systemAbs, ignoreMatcher, simulate)
+		_, err := linkIgnoredDirectory(repoAbs, systemAbs, ignoreMatcher)
 		return err
 	}
 
@@ -511,14 +427,14 @@ func linkTrackedPath(repoAbs, systemAbs string, ignoreMatcher *ignoreMatcher, si
 	return nil
 }
 
-func linkMapping(dotfilesDir string, m mapping, simulate bool) (int, error) {
+func linkMapping(dotfilesDir string, m mapping) (int, error) {
 	repoAbs := repoAbsPath(dotfilesDir, m.RepoRel)
 	ignoreMatcher, err := ignoreMatcherForExistingPath(repoAbs)
 	if err != nil {
 		return 0, fmt.Errorf("load ignore file for %s: %w", repoAbs, err)
 	}
 	if ignoreMatcher != nil {
-		return linkIgnoredDirectory(repoAbs, m.SystemAbs, ignoreMatcher, simulate)
+		return linkIgnoredDirectory(repoAbs, m.SystemAbs, ignoreMatcher)
 	}
 
 	info, err := os.Lstat(m.SystemAbs)
@@ -530,28 +446,12 @@ func linkMapping(dotfilesDir string, m mapping, simulate bool) (int, error) {
 			}
 		}
 
-		warnConflict(m.SystemAbs, simulate)
+		warnConflict(m.SystemAbs)
 		return 1, nil
 	}
 
 	if !errors.Is(err, os.ErrNotExist) {
 		return 0, fmt.Errorf("inspect %s: %w", m.SystemAbs, err)
-	}
-
-	if simulate {
-		parentDir := filepath.Dir(m.SystemAbs)
-		if info, err := os.Stat(parentDir); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				fmt.Printf("Simulate: would create directory %s\n", parentDir)
-			} else {
-				return 0, fmt.Errorf("inspect parent directory for %s: %w", m.SystemAbs, err)
-			}
-		} else if !info.IsDir() {
-			return 0, fmt.Errorf("parent directory path is not a directory: %s", parentDir)
-		}
-
-		fmt.Printf("Simulate: would link %s -> %s\n", m.SystemAbs, repoAbs)
-		return 0, nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(m.SystemAbs), 0o755); err != nil {
@@ -566,34 +466,27 @@ func linkMapping(dotfilesDir string, m mapping, simulate bool) (int, error) {
 	return 0, nil
 }
 
-func linkIgnoredDirectory(repoDir, systemDir string, ignoreMatcher *ignoreMatcher, simulate bool) (int, error) {
-	conflicts, ready, err := ensureManagedDirectory(repoDir, systemDir, simulate)
+func linkIgnoredDirectory(repoDir, systemDir string, ignoreMatcher *ignoreMatcher) (int, error) {
+	conflicts, ready, err := ensureManagedDirectory(repoDir, systemDir)
 	if err != nil || !ready {
 		return conflicts, err
 	}
 
-	childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, "", ignoreMatcher, simulate)
+	childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, "", ignoreMatcher)
 	if err != nil {
 		return conflicts, err
 	}
 
-	if !simulate {
-		fmt.Printf("Linked %s -> %s (ignoring matched entries)\n", systemDir, repoDir)
-	}
+	fmt.Printf("Linked %s -> %s (ignoring matched entries)\n", systemDir, repoDir)
 
 	return conflicts + childConflicts, nil
 }
 
-func ensureManagedDirectory(repoDir, systemDir string, simulate bool) (int, bool, error) {
+func ensureManagedDirectory(repoDir, systemDir string) (int, bool, error) {
 	info, err := os.Lstat(systemDir)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return 0, false, fmt.Errorf("inspect %s: %w", systemDir, err)
-		}
-
-		if simulate {
-			fmt.Printf("Simulate: would create directory %s\n", systemDir)
-			return 0, true, nil
 		}
 
 		if err := os.MkdirAll(systemDir, 0o755); err != nil {
@@ -610,11 +503,6 @@ func ensureManagedDirectory(repoDir, systemDir string, simulate bool) (int, bool
 	if info.Mode()&os.ModeSymlink != 0 {
 		pointsToRepo, readErr := symlinkPointsTo(systemDir, repoDir)
 		if readErr == nil && pointsToRepo {
-			if simulate {
-				fmt.Printf("Simulate: would replace symlink %s with directory\n", systemDir)
-				return 0, true, nil
-			}
-
 			if err := os.Remove(systemDir); err != nil {
 				return 0, false, fmt.Errorf("remove symlink %s: %w", systemDir, err)
 			}
@@ -627,11 +515,11 @@ func ensureManagedDirectory(repoDir, systemDir string, simulate bool) (int, bool
 		}
 	}
 
-	warnConflict(systemDir, simulate)
+	warnConflict(systemDir)
 	return 1, false, nil
 }
 
-func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher, simulate bool) (int, error) {
+func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher) (int, error) {
 	sourceDir := repoDir
 	if rel != "" {
 		sourceDir = filepath.Join(repoDir, rel)
@@ -661,7 +549,7 @@ func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher 
 		}
 
 		if info.IsDir() {
-			dirConflicts, ready, err := ensureManagedDirectory(repoPath, systemPath, simulate)
+			dirConflicts, ready, err := ensureManagedDirectory(repoPath, systemPath)
 			if err != nil {
 				return conflicts, err
 			}
@@ -670,7 +558,7 @@ func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher 
 				continue
 			}
 
-			childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, childRel, ignoreMatcher, simulate)
+			childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, childRel, ignoreMatcher)
 			if err != nil {
 				return conflicts, err
 			}
@@ -678,7 +566,7 @@ func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher 
 			continue
 		}
 
-		fileConflicts, err := ensureManagedSymlink(repoPath, systemPath, simulate)
+		fileConflicts, err := ensureManagedSymlink(repoPath, systemPath)
 		if err != nil {
 			return conflicts, err
 		}
@@ -688,7 +576,7 @@ func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher 
 	return conflicts, nil
 }
 
-func ensureManagedSymlink(repoPath, systemPath string, simulate bool) (int, error) {
+func ensureManagedSymlink(repoPath, systemPath string) (int, error) {
 	info, err := os.Lstat(systemPath)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -698,17 +586,12 @@ func ensureManagedSymlink(repoPath, systemPath string, simulate bool) (int, erro
 			}
 		}
 
-		warnConflict(systemPath, simulate)
+		warnConflict(systemPath)
 		return 1, nil
 	}
 
 	if !errors.Is(err, os.ErrNotExist) {
 		return 0, fmt.Errorf("inspect %s: %w", systemPath, err)
-	}
-
-	if simulate {
-		fmt.Printf("Simulate: would link %s -> %s\n", systemPath, repoPath)
-		return 0, nil
 	}
 
 	if err := os.Symlink(repoPath, systemPath); err != nil {
@@ -718,64 +601,7 @@ func ensureManagedSymlink(repoPath, systemPath string, simulate bool) (int, erro
 	return 0, nil
 }
 
-func simulateIgnoredDirectoryLayout(repoDir, systemDir string, ignoreMatcher *ignoreMatcher) error {
-	entries, err := os.ReadDir(repoDir)
-	if err != nil {
-		return fmt.Errorf("read directory %s: %w", repoDir, err)
-	}
-
-	for _, entry := range entries {
-		rel := entry.Name()
-		if ignoreMatcher.Match(rel) {
-			continue
-		}
-
-		if err := simulateIgnoredPath(repoDir, systemDir, rel, ignoreMatcher); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func simulateIgnoredPath(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher) error {
-	repoPath := filepath.Join(repoDir, rel)
-	systemPath := filepath.Join(systemDir, rel)
-	info, err := os.Lstat(repoPath)
-	if err != nil {
-		return fmt.Errorf("inspect %s: %w", repoPath, err)
-	}
-
-	if info.IsDir() {
-		fmt.Printf("Simulate: would create directory %s\n", systemPath)
-		entries, err := os.ReadDir(repoPath)
-		if err != nil {
-			return fmt.Errorf("read directory %s: %w", repoPath, err)
-		}
-
-		for _, entry := range entries {
-			childRel := filepath.Join(rel, entry.Name())
-			if ignoreMatcher.Match(childRel) {
-				continue
-			}
-			if err := simulateIgnoredPath(repoDir, systemDir, childRel, ignoreMatcher); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	}
-
-	fmt.Printf("Simulate: would link %s -> %s\n", systemPath, repoPath)
-	return nil
-}
-
-func warnConflict(path string, simulate bool) {
-	if simulate {
-		fmt.Fprintf(os.Stderr, "Simulate: conflict at %s (manual resolution required)\n", path)
-		return
-	}
-
+func warnConflict(path string) {
 	fmt.Fprintf(os.Stderr, "Warning: conflict at %s (manual resolution required)\n", path)
 }
 
@@ -1246,13 +1072,10 @@ func printUsage() {
 	fmt.Println("dot - minimalist dotfile manager")
 	fmt.Println("")
 	fmt.Println("usage:")
-	fmt.Println("  dot [--simulate|-n] track <file> [target_path]")
-	fmt.Println("  dot [--simulate|-n] link")
-	fmt.Println("  dot [--simulate|-n] list")
-	fmt.Println("  dot [--simulate|-n] sync")
-	fmt.Println("")
-	fmt.Println("Options:")
-	fmt.Println("  -n, --simulate  Dry run; print actions without making changes")
+	fmt.Println("  dot track <file> [target_path]")
+	fmt.Println("  dot link")
+	fmt.Println("  dot list")
+	fmt.Println("  dot sync")
 	fmt.Println("")
 	fmt.Println("Environment:")
 	fmt.Println("  DOTFILES  Repository path (default: ~/.dotfiles)")

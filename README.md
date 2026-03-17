@@ -47,12 +47,6 @@ Apply all mappings from `.dot.map`:
 dot link
 ```
 
-Preview actions without changing anything:
-
-```bash
-dot --simulate link
-```
-
 Show status of tracked files (`OK`, `STRAY`, `MISSING`, `BROKEN`):
 
 ```bash
