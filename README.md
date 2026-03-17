@@ -59,6 +59,9 @@ Show status of tracked files (`OK`, `STRAY`, `MISSING`, `BROKEN`):
 dot list
 ```
 
+Ignore files in tracked directories with `.dot-local-ignore`
+(or `.stow-local-ignore`), one regex per line, for example `^/README.*`.
+
 Add, commit, and push repo changes:
 
 ```bash

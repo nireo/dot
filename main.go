@@ -7,12 +7,16 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 )
 
 const mapFileName = ".dot.map"
+const localIgnoreFileName = ".dot-local-ignore"
+const compatIgnoreFileName = ".stow-local-ignore"
 
 type mapping struct {
 	RepoRel   string
@@ -23,6 +27,11 @@ type mapping struct {
 
 type globalOptions struct {
 	Simulate bool
+}
+
+type ignoreMatcher struct {
+	basename []*regexp.Regexp
+	path     []*regexp.Regexp
 }
 
 func main() {
@@ -182,7 +191,20 @@ func cmdTrackWithSimulate(dotfilesDir string, args []string, simulate bool) erro
 		}
 
 		fmt.Printf("Simulate: would move %s -> %s\n", sourceAbs, repoAbs)
-		fmt.Printf("Simulate: would create symlink %s -> %s\n", sourceAbs, repoAbs)
+
+		ignoreMatcher, err := ignoreMatcherForDir(sourceAbs, info)
+		if err != nil {
+			return err
+		}
+
+		if ignoreMatcher != nil {
+			if err := simulateIgnoredDirectoryLayout(sourceAbs, sourceAbs, ignoreMatcher); err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("Simulate: would create symlink %s -> %s\n", sourceAbs, repoAbs)
+		}
+
 		fmt.Printf("Simulate: would append mapping %s : %s\n", repoRel, compressHome(sourceAbs))
 		return nil
 	}
@@ -203,16 +225,26 @@ func cmdTrackWithSimulate(dotfilesDir string, args []string, simulate bool) erro
 		return fmt.Errorf("move verification failed: %w", err)
 	}
 
-	if err := os.Symlink(repoAbs, sourceAbs); err != nil {
+	ignoreMatcher, err := ignoreMatcherForDir(repoAbs, info)
+	if err != nil {
 		rollbackErr := movePath(repoAbs, sourceAbs)
 		if rollbackErr != nil {
-			return fmt.Errorf("create symlink failed (%v) and rollback failed (%v)", err, rollbackErr)
+			return fmt.Errorf("load ignore file failed (%v) and rollback failed (%v)", err, rollbackErr)
+		}
+		return err
+	}
+
+	if err := linkTrackedPath(repoAbs, sourceAbs, ignoreMatcher, false); err != nil {
+		removeErr := os.RemoveAll(sourceAbs)
+		rollbackErr := movePath(repoAbs, sourceAbs)
+		if rollbackErr != nil {
+			return fmt.Errorf("create symlink failed (%v), rollback remove link layout (%v), rollback move file (%v)", err, removeErr, rollbackErr)
 		}
 		return fmt.Errorf("create symlink: %w", err)
 	}
 
 	if err := appendMapping(mapPath, repoRel, compressHome(sourceAbs)); err != nil {
-		removeErr := os.Remove(sourceAbs)
+		removeErr := os.RemoveAll(sourceAbs)
 		rollbackErr := movePath(repoAbs, sourceAbs)
 		if removeErr != nil || rollbackErr != nil {
 			return fmt.Errorf("write map failed (%v), rollback remove symlink (%v), rollback move file (%v)", err, removeErr, rollbackErr)
@@ -242,55 +274,11 @@ func cmdLinkWithSimulate(dotfilesDir string, simulate bool) error {
 
 	conflicts := 0
 	for _, m := range mappings {
-		repoAbs := repoAbsPath(dotfilesDir, m.RepoRel)
-
-		info, err := os.Lstat(m.SystemAbs)
-		if err == nil {
-			if info.Mode()&os.ModeSymlink != 0 {
-				pointsToRepo, readErr := symlinkPointsTo(m.SystemAbs, repoAbs)
-				if readErr == nil && pointsToRepo {
-					continue
-				}
-			}
-
-			conflicts++
-			if simulate {
-				fmt.Fprintf(os.Stderr, "Simulate: conflict at %s (manual resolution required)\n", m.SystemAbs)
-			} else {
-				fmt.Fprintf(os.Stderr, "Warning: conflict at %s (manual resolution required)\n", m.SystemAbs)
-			}
-			continue
+		mappingConflicts, err := linkMapping(dotfilesDir, m, simulate)
+		if err != nil {
+			return err
 		}
-
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("inspect %s: %w", m.SystemAbs, err)
-		}
-
-		if simulate {
-			parentDir := filepath.Dir(m.SystemAbs)
-			if info, err := os.Stat(parentDir); err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					fmt.Printf("Simulate: would create directory %s\n", parentDir)
-				} else {
-					return fmt.Errorf("inspect parent directory for %s: %w", m.SystemAbs, err)
-				}
-			} else if !info.IsDir() {
-				return fmt.Errorf("parent directory path is not a directory: %s", parentDir)
-			}
-
-			fmt.Printf("Simulate: would link %s -> %s\n", m.SystemAbs, repoAbs)
-			continue
-		}
-
-		if err := os.MkdirAll(filepath.Dir(m.SystemAbs), 0o755); err != nil {
-			return fmt.Errorf("create parent directory for %s: %w", m.SystemAbs, err)
-		}
-
-		if err := os.Symlink(repoAbs, m.SystemAbs); err != nil {
-			return fmt.Errorf("create symlink %s: %w", m.SystemAbs, err)
-		}
-
-		fmt.Printf("Linked %s -> %s\n", m.SystemAbs, repoAbs)
+		conflicts += mappingConflicts
 	}
 
 	if conflicts > 0 {
@@ -451,6 +439,14 @@ func appendMapping(mapPath, repoRel, systemPath string) error {
 
 func mappingStatus(dotfilesDir string, m mapping) (string, error) {
 	repoAbs := repoAbsPath(dotfilesDir, m.RepoRel)
+	ignoreMatcher, err := ignoreMatcherForExistingPath(repoAbs)
+	if err != nil {
+		return "", err
+	}
+	if ignoreMatcher != nil {
+		return mappingStatusWithIgnore(repoAbs, m.SystemAbs, ignoreMatcher)
+	}
+
 	info, err := os.Lstat(m.SystemAbs)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -500,6 +496,528 @@ func symlinkPointsTo(linkPath, expectedTarget string) (bool, error) {
 	expectedTarget = filepath.Clean(expectedTarget)
 
 	return target == expectedTarget, nil
+}
+
+func linkTrackedPath(repoAbs, systemAbs string, ignoreMatcher *ignoreMatcher, simulate bool) error {
+	if ignoreMatcher != nil {
+		_, err := linkIgnoredDirectory(repoAbs, systemAbs, ignoreMatcher, simulate)
+		return err
+	}
+
+	if err := os.Symlink(repoAbs, systemAbs); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func linkMapping(dotfilesDir string, m mapping, simulate bool) (int, error) {
+	repoAbs := repoAbsPath(dotfilesDir, m.RepoRel)
+	ignoreMatcher, err := ignoreMatcherForExistingPath(repoAbs)
+	if err != nil {
+		return 0, fmt.Errorf("load ignore file for %s: %w", repoAbs, err)
+	}
+	if ignoreMatcher != nil {
+		return linkIgnoredDirectory(repoAbs, m.SystemAbs, ignoreMatcher, simulate)
+	}
+
+	info, err := os.Lstat(m.SystemAbs)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			pointsToRepo, readErr := symlinkPointsTo(m.SystemAbs, repoAbs)
+			if readErr == nil && pointsToRepo {
+				return 0, nil
+			}
+		}
+
+		warnConflict(m.SystemAbs, simulate)
+		return 1, nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("inspect %s: %w", m.SystemAbs, err)
+	}
+
+	if simulate {
+		parentDir := filepath.Dir(m.SystemAbs)
+		if info, err := os.Stat(parentDir); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				fmt.Printf("Simulate: would create directory %s\n", parentDir)
+			} else {
+				return 0, fmt.Errorf("inspect parent directory for %s: %w", m.SystemAbs, err)
+			}
+		} else if !info.IsDir() {
+			return 0, fmt.Errorf("parent directory path is not a directory: %s", parentDir)
+		}
+
+		fmt.Printf("Simulate: would link %s -> %s\n", m.SystemAbs, repoAbs)
+		return 0, nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(m.SystemAbs), 0o755); err != nil {
+		return 0, fmt.Errorf("create parent directory for %s: %w", m.SystemAbs, err)
+	}
+
+	if err := os.Symlink(repoAbs, m.SystemAbs); err != nil {
+		return 0, fmt.Errorf("create symlink %s: %w", m.SystemAbs, err)
+	}
+
+	fmt.Printf("Linked %s -> %s\n", m.SystemAbs, repoAbs)
+	return 0, nil
+}
+
+func linkIgnoredDirectory(repoDir, systemDir string, ignoreMatcher *ignoreMatcher, simulate bool) (int, error) {
+	conflicts, ready, err := ensureManagedDirectory(repoDir, systemDir, simulate)
+	if err != nil || !ready {
+		return conflicts, err
+	}
+
+	childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, "", ignoreMatcher, simulate)
+	if err != nil {
+		return conflicts, err
+	}
+
+	if !simulate {
+		fmt.Printf("Linked %s -> %s (ignoring matched entries)\n", systemDir, repoDir)
+	}
+
+	return conflicts + childConflicts, nil
+}
+
+func ensureManagedDirectory(repoDir, systemDir string, simulate bool) (int, bool, error) {
+	info, err := os.Lstat(systemDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return 0, false, fmt.Errorf("inspect %s: %w", systemDir, err)
+		}
+
+		if simulate {
+			fmt.Printf("Simulate: would create directory %s\n", systemDir)
+			return 0, true, nil
+		}
+
+		if err := os.MkdirAll(systemDir, 0o755); err != nil {
+			return 0, false, fmt.Errorf("create directory %s: %w", systemDir, err)
+		}
+
+		return 0, true, nil
+	}
+
+	if info.IsDir() {
+		return 0, true, nil
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		pointsToRepo, readErr := symlinkPointsTo(systemDir, repoDir)
+		if readErr == nil && pointsToRepo {
+			if simulate {
+				fmt.Printf("Simulate: would replace symlink %s with directory\n", systemDir)
+				return 0, true, nil
+			}
+
+			if err := os.Remove(systemDir); err != nil {
+				return 0, false, fmt.Errorf("remove symlink %s: %w", systemDir, err)
+			}
+
+			if err := os.Mkdir(systemDir, 0o755); err != nil {
+				return 0, false, fmt.Errorf("create directory %s: %w", systemDir, err)
+			}
+
+			return 0, true, nil
+		}
+	}
+
+	warnConflict(systemDir, simulate)
+	return 1, false, nil
+}
+
+func linkIgnoredDirectoryContents(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher, simulate bool) (int, error) {
+	sourceDir := repoDir
+	if rel != "" {
+		sourceDir = filepath.Join(repoDir, rel)
+	}
+
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return 0, fmt.Errorf("read directory %s: %w", sourceDir, err)
+	}
+
+	conflicts := 0
+	for _, entry := range entries {
+		childRel := entry.Name()
+		if rel != "" {
+			childRel = filepath.Join(rel, entry.Name())
+		}
+
+		if ignoreMatcher.Match(childRel) {
+			continue
+		}
+
+		repoPath := filepath.Join(repoDir, childRel)
+		systemPath := filepath.Join(systemDir, childRel)
+		info, err := entry.Info()
+		if err != nil {
+			return conflicts, fmt.Errorf("inspect %s: %w", repoPath, err)
+		}
+
+		if info.IsDir() {
+			dirConflicts, ready, err := ensureManagedDirectory(repoPath, systemPath, simulate)
+			if err != nil {
+				return conflicts, err
+			}
+			conflicts += dirConflicts
+			if !ready {
+				continue
+			}
+
+			childConflicts, err := linkIgnoredDirectoryContents(repoDir, systemDir, childRel, ignoreMatcher, simulate)
+			if err != nil {
+				return conflicts, err
+			}
+			conflicts += childConflicts
+			continue
+		}
+
+		fileConflicts, err := ensureManagedSymlink(repoPath, systemPath, simulate)
+		if err != nil {
+			return conflicts, err
+		}
+		conflicts += fileConflicts
+	}
+
+	return conflicts, nil
+}
+
+func ensureManagedSymlink(repoPath, systemPath string, simulate bool) (int, error) {
+	info, err := os.Lstat(systemPath)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			pointsToRepo, readErr := symlinkPointsTo(systemPath, repoPath)
+			if readErr == nil && pointsToRepo {
+				return 0, nil
+			}
+		}
+
+		warnConflict(systemPath, simulate)
+		return 1, nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("inspect %s: %w", systemPath, err)
+	}
+
+	if simulate {
+		fmt.Printf("Simulate: would link %s -> %s\n", systemPath, repoPath)
+		return 0, nil
+	}
+
+	if err := os.Symlink(repoPath, systemPath); err != nil {
+		return 0, fmt.Errorf("create symlink %s: %w", systemPath, err)
+	}
+
+	return 0, nil
+}
+
+func simulateIgnoredDirectoryLayout(repoDir, systemDir string, ignoreMatcher *ignoreMatcher) error {
+	entries, err := os.ReadDir(repoDir)
+	if err != nil {
+		return fmt.Errorf("read directory %s: %w", repoDir, err)
+	}
+
+	for _, entry := range entries {
+		rel := entry.Name()
+		if ignoreMatcher.Match(rel) {
+			continue
+		}
+
+		if err := simulateIgnoredPath(repoDir, systemDir, rel, ignoreMatcher); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func simulateIgnoredPath(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher) error {
+	repoPath := filepath.Join(repoDir, rel)
+	systemPath := filepath.Join(systemDir, rel)
+	info, err := os.Lstat(repoPath)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", repoPath, err)
+	}
+
+	if info.IsDir() {
+		fmt.Printf("Simulate: would create directory %s\n", systemPath)
+		entries, err := os.ReadDir(repoPath)
+		if err != nil {
+			return fmt.Errorf("read directory %s: %w", repoPath, err)
+		}
+
+		for _, entry := range entries {
+			childRel := filepath.Join(rel, entry.Name())
+			if ignoreMatcher.Match(childRel) {
+				continue
+			}
+			if err := simulateIgnoredPath(repoDir, systemDir, childRel, ignoreMatcher); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	fmt.Printf("Simulate: would link %s -> %s\n", systemPath, repoPath)
+	return nil
+}
+
+func warnConflict(path string, simulate bool) {
+	if simulate {
+		fmt.Fprintf(os.Stderr, "Simulate: conflict at %s (manual resolution required)\n", path)
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Warning: conflict at %s (manual resolution required)\n", path)
+}
+
+func ignoreMatcherForDir(path string, info os.FileInfo) (*ignoreMatcher, error) {
+	if info == nil || !info.IsDir() {
+		return nil, nil
+	}
+
+	return loadIgnoreMatcher(path)
+}
+
+func ignoreMatcherForExistingPath(path string) (*ignoreMatcher, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, nil
+	}
+
+	return loadIgnoreMatcher(path)
+}
+
+func loadIgnoreMatcher(packageDir string) (*ignoreMatcher, error) {
+	matcher := &ignoreMatcher{}
+	loaded := false
+
+	for _, name := range []string{localIgnoreFileName, compatIgnoreFileName} {
+		ignorePath := filepath.Join(packageDir, name)
+		f, err := os.Open(ignorePath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("open ignore file %s: %w", ignorePath, err)
+		}
+
+		loaded = true
+		scanner := bufio.NewScanner(f)
+		lineNumber := 0
+		for scanner.Scan() {
+			lineNumber++
+			pattern := stripIgnoreComment(scanner.Text())
+			if pattern == "" {
+				continue
+			}
+
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				f.Close()
+				return nil, fmt.Errorf("invalid ignore pattern at %s:%d: %w", ignorePath, lineNumber, err)
+			}
+
+			if strings.Contains(pattern, "/") {
+				matcher.path = append(matcher.path, re)
+			} else {
+				matcher.basename = append(matcher.basename, re)
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("read ignore file %s: %w", ignorePath, err)
+		}
+
+		if err := f.Close(); err != nil {
+			return nil, fmt.Errorf("close ignore file %s: %w", ignorePath, err)
+		}
+	}
+
+	if !loaded {
+		return nil, nil
+	}
+
+	return matcher, nil
+}
+
+func stripIgnoreComment(line string) string {
+	for i := 0; i < len(line); i++ {
+		if line[i] != '#' {
+			continue
+		}
+
+		backslashes := 0
+		for j := i - 1; j >= 0 && line[j] == '\\'; j-- {
+			backslashes++
+		}
+
+		if backslashes%2 == 0 {
+			return strings.TrimSpace(line[:i])
+		}
+	}
+
+	return strings.TrimSpace(line)
+}
+
+func (m *ignoreMatcher) Match(rel string) bool {
+	if m == nil {
+		return false
+	}
+
+	rel = filepath.ToSlash(filepath.Clean(rel))
+	if rel == "." || rel == "" {
+		return false
+	}
+
+	base := path.Base(rel)
+	if base == localIgnoreFileName || base == compatIgnoreFileName {
+		return true
+	}
+
+	for _, re := range m.path {
+		for _, candidate := range ignorePathCandidates(rel) {
+			if matchesFullRegexp(re, candidate) {
+				return true
+			}
+		}
+	}
+
+	for _, re := range m.basename {
+		if matchesFullRegexp(re, base) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func ignorePathCandidates(rel string) []string {
+	parts := strings.Split(rel, "/")
+	candidates := make([]string, 0, len(parts)*2)
+	for i := 0; i < len(parts); i++ {
+		suffix := strings.Join(parts[i:], "/")
+		candidates = append(candidates, "/"+suffix, suffix)
+	}
+	return candidates
+}
+
+func matchesFullRegexp(re *regexp.Regexp, value string) bool {
+	loc := re.FindStringIndex(value)
+	return loc != nil && loc[0] == 0 && loc[1] == len(value)
+}
+
+func mappingStatusWithIgnore(repoDir, systemDir string, ignoreMatcher *ignoreMatcher) (string, error) {
+	if _, err := os.Stat(repoDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "BROKEN", nil
+		}
+		return "", err
+	}
+
+	info, err := os.Lstat(systemDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "MISSING", nil
+		}
+		return "", err
+	}
+
+	if !info.IsDir() {
+		return "STRAY", nil
+	}
+
+	return ignoredDirectoryStatus(repoDir, systemDir, "", ignoreMatcher)
+}
+
+func ignoredDirectoryStatus(repoDir, systemDir, rel string, ignoreMatcher *ignoreMatcher) (string, error) {
+	sourceDir := repoDir
+	if rel != "" {
+		sourceDir = filepath.Join(repoDir, rel)
+	}
+
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "BROKEN", nil
+		}
+		return "", err
+	}
+
+	for _, entry := range entries {
+		childRel := entry.Name()
+		if rel != "" {
+			childRel = filepath.Join(rel, entry.Name())
+		}
+
+		if ignoreMatcher.Match(childRel) {
+			continue
+		}
+
+		repoPath := filepath.Join(repoDir, childRel)
+		systemPath := filepath.Join(systemDir, childRel)
+		info, err := entry.Info()
+		if err != nil {
+			return "", err
+		}
+
+		targetInfo, err := os.Lstat(systemPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "MISSING", nil
+			}
+			return "", err
+		}
+
+		if info.IsDir() {
+			if !targetInfo.IsDir() {
+				return "STRAY", nil
+			}
+
+			status, err := ignoredDirectoryStatus(repoDir, systemDir, childRel, ignoreMatcher)
+			if err != nil || status != "OK" {
+				return status, err
+			}
+			continue
+		}
+
+		if targetInfo.Mode()&os.ModeSymlink == 0 {
+			return "STRAY", nil
+		}
+
+		pointsToRepo, err := symlinkPointsTo(systemPath, repoPath)
+		if err != nil {
+			return "", err
+		}
+		if !pointsToRepo {
+			return "STRAY", nil
+		}
+
+		if _, err := os.Stat(repoPath); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "BROKEN", nil
+			}
+			return "", err
+		}
+	}
+
+	return "OK", nil
 }
 
 func movePath(src, dst string) error {

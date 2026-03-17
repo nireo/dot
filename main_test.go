@@ -136,6 +136,47 @@ func TestParseMap(t *testing.T) {
 	})
 }
 
+func TestIgnoreMatcherMatch(t *testing.T) {
+	packageDir := t.TempDir()
+	ignorePath := filepath.Join(packageDir, compatIgnoreFileName)
+	content := strings.Join([]string{
+		"# comments are ignored",
+		"README.*",
+		"^/docs/.*",
+		"foo\\#bar # keep escaped hash",
+	}, "\n") + "\n"
+
+	if err := os.WriteFile(ignorePath, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write ignore file: %v", err)
+	}
+
+	matcher, err := loadIgnoreMatcher(packageDir)
+	if err != nil {
+		t.Fatalf("loadIgnoreMatcher returned error: %v", err)
+	}
+	if matcher == nil {
+		t.Fatalf("expected ignore matcher to be loaded")
+	}
+
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "README.md", want: true},
+		{path: "docs/init.lua", want: true},
+		{path: "foo#bar", want: true},
+		{path: localIgnoreFileName, want: true},
+		{path: compatIgnoreFileName, want: true},
+		{path: "lua/plugins.lua", want: false},
+	}
+
+	for _, tc := range tests {
+		if got := matcher.Match(tc.path); got != tc.want {
+			t.Fatalf("matcher.Match(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestSymlinkPointsTo(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target.txt")
@@ -546,5 +587,150 @@ func TestIntegrationTrackDirectoryAndLink(t *testing.T) {
 	}
 	if !ok {
 		t.Fatalf("relinked system directory does not point to repo directory")
+	}
+}
+
+func TestIntegrationLinkDirectoryWithIgnoreFile(t *testing.T) {
+	root := t.TempDir()
+	dotfilesDir := filepath.Join(root, "dotfiles")
+	homeDir := filepath.Join(root, "home")
+	systemDir := filepath.Join(homeDir, ".config", "nvim")
+	repoDir := filepath.Join(dotfilesDir, "nvim")
+	repoInit := filepath.Join(repoDir, "init.lua")
+	repoPlugins := filepath.Join(repoDir, "lua", "plugins.lua")
+
+	if err := os.MkdirAll(filepath.Dir(repoPlugins), 0o755); err != nil {
+		t.Fatalf("failed to create repo directories: %v", err)
+	}
+	if err := os.WriteFile(repoInit, []byte("vim.o.number = true\n"), 0o644); err != nil {
+		t.Fatalf("failed to write repo init.lua: %v", err)
+	}
+	if err := os.WriteFile(repoPlugins, []byte("return {}\n"), 0o644); err != nil {
+		t.Fatalf("failed to write repo plugins.lua: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("docs\n"), 0o644); err != nil {
+		t.Fatalf("failed to write repo README.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, localIgnoreFileName), []byte("^/README.*\n"), 0o644); err != nil {
+		t.Fatalf("failed to write ignore file: %v", err)
+	}
+
+	mapPath := filepath.Join(dotfilesDir, mapFileName)
+	mapContent := "nvim : " + systemDir + "\n"
+	if err := os.WriteFile(mapPath, []byte(mapContent), 0o644); err != nil {
+		t.Fatalf("failed to write map file: %v", err)
+	}
+
+	if err := cmdLink(dotfilesDir); err != nil {
+		t.Fatalf("cmdLink failed: %v", err)
+	}
+
+	info, err := os.Lstat(systemDir)
+	if err != nil {
+		t.Fatalf("failed to inspect linked system directory: %v", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("system directory should be a real directory when ignore file is present")
+	}
+
+	ok, err := symlinkPointsTo(filepath.Join(systemDir, "init.lua"), repoInit)
+	if err != nil {
+		t.Fatalf("failed to inspect init.lua symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("init.lua symlink does not point to repo file")
+	}
+
+	nestedInfo, err := os.Lstat(filepath.Join(systemDir, "lua"))
+	if err != nil {
+		t.Fatalf("failed to inspect nested linked directory: %v", err)
+	}
+	if !nestedInfo.IsDir() || nestedInfo.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("nested directory should be a real directory when ignore file is present")
+	}
+
+	ok, err = symlinkPointsTo(filepath.Join(systemDir, "lua", "plugins.lua"), repoPlugins)
+	if err != nil {
+		t.Fatalf("failed to inspect plugins.lua symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("plugins.lua symlink does not point to repo file")
+	}
+
+	if _, err := os.Lstat(filepath.Join(systemDir, "README.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("README.md should be ignored, err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(systemDir, localIgnoreFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ignore file should never be linked, err=%v", err)
+	}
+
+	status, err := mappingStatus(dotfilesDir, mapping{RepoRel: "nvim", SystemRaw: systemDir, SystemAbs: systemDir})
+	if err != nil {
+		t.Fatalf("mappingStatus returned error: %v", err)
+	}
+	if status != "OK" {
+		t.Fatalf("mappingStatus = %q, want OK", status)
+	}
+}
+
+func TestIntegrationTrackDirectoryWithIgnoreFile(t *testing.T) {
+	root := t.TempDir()
+	dotfilesDir := filepath.Join(root, "dotfiles")
+	homeDir := filepath.Join(root, "home")
+	systemDir := filepath.Join(homeDir, ".config", "nvim")
+	systemInit := filepath.Join(systemDir, "init.lua")
+
+	if err := os.MkdirAll(systemDir, 0o755); err != nil {
+		t.Fatalf("failed to create system directory: %v", err)
+	}
+	if err := os.WriteFile(systemInit, []byte("vim.o.number = true\n"), 0o644); err != nil {
+		t.Fatalf("failed to write system init.lua: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(systemDir, "README.md"), []byte("docs\n"), 0o644); err != nil {
+		t.Fatalf("failed to write system README.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(systemDir, localIgnoreFileName), []byte("^/README.*\n"), 0o644); err != nil {
+		t.Fatalf("failed to write ignore file: %v", err)
+	}
+
+	if err := cmdTrack(dotfilesDir, []string{systemDir, "nvim"}); err != nil {
+		t.Fatalf("cmdTrack failed: %v", err)
+	}
+
+	repoDir := filepath.Join(dotfilesDir, "nvim")
+	repoInit := filepath.Join(repoDir, "init.lua")
+	if _, err := os.Stat(filepath.Join(repoDir, "README.md")); err != nil {
+		t.Fatalf("tracked repo should keep ignored README.md: %v", err)
+	}
+
+	info, err := os.Lstat(systemDir)
+	if err != nil {
+		t.Fatalf("failed to inspect tracked system directory: %v", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("tracked system directory should be a real directory when ignore file is present")
+	}
+
+	ok, err := symlinkPointsTo(filepath.Join(systemDir, "init.lua"), repoInit)
+	if err != nil {
+		t.Fatalf("failed to inspect tracked init.lua symlink: %v", err)
+	}
+	if !ok {
+		t.Fatalf("tracked init.lua symlink does not point to repo file")
+	}
+
+	if _, err := os.Lstat(filepath.Join(systemDir, "README.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("README.md should be ignored after track, err=%v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(systemDir, localIgnoreFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ignore file should not be linked after track, err=%v", err)
+	}
+
+	status, err := mappingStatus(dotfilesDir, mapping{RepoRel: "nvim", SystemRaw: systemDir, SystemAbs: systemDir})
+	if err != nil {
+		t.Fatalf("mappingStatus returned error: %v", err)
+	}
+	if status != "OK" {
+		t.Fatalf("mappingStatus = %q, want OK", status)
 	}
 }
