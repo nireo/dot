@@ -70,6 +70,7 @@ func run(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: dot %s", args[0])
 	}
+
 	return cmd(dotfilesDir)
 }
 
