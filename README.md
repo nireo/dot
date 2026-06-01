@@ -1,6 +1,6 @@
 # dot
 
-Minimal dotfile manager written in Go.
+Minimal dotfile manager written in Ruby. For some reason every time I tried to setup GNU stow it didn't work as I wanted it to. So I mainly wrote this in the way that I understand how these systems work. `dot` holds a mapping from folders/files to where they should be on disk, from this mapping it creates symlinks to the correct places such that the configurations can by read by different software. All in a few hundred lines of easily understandable Ruby code.
 
 ## Build
 
