@@ -1,7 +1,21 @@
 require "minitest/autorun"
 require "tmpdir"
 require "fileutils"
-require_relative "main"
+require_relative "dot"
+
+class TestRepoPathForTrackTarget < Minitest::Test
+  def test_exact_target_path
+    assert_equal "pi", repo_path_for_track_target("pi", "/tmp/home/.pi/agents")
+  end
+
+  def test_trailing_slash_appends_source_basename
+    assert_equal "pi/agents", repo_path_for_track_target("pi/", "/tmp/home/.pi/agents")
+  end
+
+  def test_trailing_slash_works_for_files
+    assert_equal "shell/.bashrc", repo_path_for_track_target("shell/", "/tmp/home/.bashrc")
+  end
+end
 
 class TestSanitizeRepoPath < Minitest::Test
   def test_simple
@@ -255,6 +269,27 @@ class TestIntegrationTrackDirectoryAndLink < Minitest::Test
       cmd_link(dotfiles_dir)
 
       assert symlink_points_to?(system_dir, repo_dir)
+    end
+  end
+
+  def test_track_directory_into_repo_dir
+    Dir.mktmpdir do |root|
+      dotfiles_dir = File.join(root, "dotfiles")
+      home_dir = File.join(root, "home")
+      system_dir = File.join(home_dir, ".pi", "agents")
+      system_file = File.join(system_dir, "default.md")
+
+      FileUtils.mkdir_p(system_dir)
+      File.write(system_file, "pi agent config\n")
+
+      cmd_track(dotfiles_dir, [system_dir, "pi/"])
+
+      repo_dir = File.join(dotfiles_dir, "pi", "agents")
+      assert_equal "pi agent config\n", File.read(File.join(repo_dir, "default.md"))
+      assert symlink_points_to?(system_dir, repo_dir)
+
+      map_data = File.read(File.join(dotfiles_dir, MAP_FILE))
+      assert_includes map_data, "pi/agents : "
     end
   end
 end

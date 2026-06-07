@@ -2,13 +2,7 @@
 
 Minimal dotfile manager written in Ruby. For some reason every time I tried to setup GNU stow it didn't work as I wanted it to. So I mainly wrote this in the way that I understand how these systems work. `dot` holds a mapping from folders/files to where they should be on disk, from this mapping it creates symlinks to the correct places such that the configurations can by read by different software. All in a few hundred lines of easily understandable Ruby code.
 
-## Build
-
-```bash
-go build -o dot .
-```
-
-Optional install:
+## Install
 
 ```bash
 ./install.sh
@@ -39,6 +33,14 @@ Track a directory (including subdirectories) into your dotfiles repo:
 
 ```bash
 dot track ~/.config/nvim nvim
+```
+
+Track a nested config without tracking its whole parent directory. A target path
+ending in `/` is treated as a repo directory and the source basename is appended:
+
+```bash
+dot track ~/.pi/agents pi/
+# stores it as $DOTFILES/pi/agents and maps that to ~/.pi/agents
 ```
 
 Apply all mappings from `.dot.map`:

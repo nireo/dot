@@ -48,8 +48,11 @@ def cmd_track(dotfiles_dir, args)
   raise "source path is a symlink (track expects a regular file or directory): #{source_abs}" if info.symlink?
   raise "source path must be a regular file or directory: #{source_abs}" unless info.file? || info.directory?
 
-  repo_arg, repo_label = args.length == 2 ? [args[1], "target_path"] : [File.basename(source_abs), "source file name"]
-  begin; repo_rel = sanitize_repo_path(repo_arg); rescue => e; raise "invalid #{repo_label}: #{e.message}"; end
+  if args.length == 2
+    begin; repo_rel = repo_path_for_track_target(args[1], source_abs); rescue => e; raise "invalid target_path: #{e.message}"; end
+  else
+    begin; repo_rel = sanitize_repo_path(File.basename(source_abs)); rescue => e; raise "invalid source file name: #{e.message}"; end
+  end
 
   map_path = File.join(dotfiles_dir, MAP_FILE)
   mappings = parse_map(map_path, dotfiles_dir)
@@ -276,6 +279,12 @@ def expand_path(raw, dotfiles_dir)
   clean(p)
 end
 
+def repo_path_for_track_target(raw, source_abs)
+  target = raw.strip
+  repo_rel = sanitize_repo_path(target)
+  target.end_with?("/") ? sanitize_repo_path(File.join(repo_rel, File.basename(source_abs))) : repo_rel
+end
+
 def sanitize_repo_path(raw)
   c = clean(raw.strip)
   raise "path cannot be empty" if c.empty?
@@ -291,7 +300,7 @@ def compress_home(path)
 end
 
 def print_usage
-  puts "dot - minimalist dotfile manager\n\nusage:\n  dot track <file> [target_path]\n  dot link\n  dot list\n  dot sync\n\nEnvironment:\n  DOTFILES  Repository path (default: ~/.dotfiles)\n"
+  puts "dot - minimalist dotfile manager\n\nusage:\n  dot track <file> [target_path|target_dir/]\n  dot link\n  dot list\n  dot sync\n\nEnvironment:\n  DOTFILES  Repository path (default: ~/.dotfiles)\n"
 end
 
 if __FILE__ == $PROGRAM_NAME
