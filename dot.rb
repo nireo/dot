@@ -3,6 +3,7 @@
 require "fileutils"
 require "pathname"
 require "find"
+require "tmpdir"
 
 MAP_FILE, LOCAL_IGNORE, COMPAT_IGNORE = ".dot.map", ".dot-local-ignore", ".stow-local-ignore"
 Mapping = Struct.new(:repo_rel, :system_raw, :system_abs, :line)
@@ -31,12 +32,124 @@ def run(args)
 
   case args[0]
   when "track" then cmd_track(dotfiles_dir, args[1..])
+  when "untrack" then cmd_untrack(dotfiles_dir, args[1..])
   when "help", "-h", "--help" then print_usage
   else
     cmd = { "link" => :cmd_link, "list" => :cmd_list, "sync" => :cmd_sync }[args[0]]
     (print_usage; raise "unknown command: #{args[0]}") unless cmd
     raise "usage: dot #{args[0]}" if args.length != 1
     send(cmd, dotfiles_dir)
+  end
+end
+
+def cmd_untrack(dotfiles_dir, args)
+  raise "usage: dot untrack <system_path|repo_path>" unless args.length == 1
+  map_path = File.join(dotfiles_dir, MAP_FILE)
+  mappings = parse_map(map_path, dotfiles_dir)
+  input = args[0]
+  system_path = expand_path(input, dotfiles_dir)
+  repo_path = begin; sanitize_repo_path(input); rescue RuntimeError; nil; end
+  matches = mappings.select do |m|
+    m.system_abs == system_path || m.repo_rel == repo_path || File.join(dotfiles_dir, m.repo_rel) == system_path
+  end
+  raise "no mapping found for #{input}" if matches.empty?
+  raise "ambiguous mapping for #{input}" if matches.length != 1
+  mapping = matches.first
+
+  repo_abs = File.join(dotfiles_dir, mapping.repo_rel)
+  system_abs = mapping.system_abs
+  repo_info = File.lstat(repo_abs)
+  raise "repo path must be a regular file or directory: #{repo_abs}" unless repo_info.file? || repo_info.directory?
+  raise "system path is inside DOTFILES: #{system_abs}" if system_abs == dotfiles_dir || system_abs.start_with?(dotfiles_dir + "/")
+  real_parent = File.realpath(File.dirname(system_abs))
+  raise "system path resolves inside DOTFILES: #{system_abs}" if real_parent == dotfiles_dir || real_parent.start_with?(dotfiles_dir + "/")
+  raise "mapping file must be a regular file: #{map_path}" unless File.lstat(map_path).file?
+  overlaps = mappings.any? do |m|
+    m != mapping && (m.repo_rel.start_with?(mapping.repo_rel + "/") || mapping.repo_rel.start_with?(m.repo_rel + "/"))
+  end
+  raise "another mapping uses part of #{mapping.repo_rel}" if overlaps
+  raise "cannot untrack #{input}: expected a working link at #{system_abs}" unless mapping_status(dotfiles_dir, mapping) == "OK"
+  raise "repo contains an absolute symlink into itself: #{repo_abs}" if absolute_symlink_into?(repo_abs)
+
+  matcher = ignore_matcher_for_path(repo_abs, nil)
+  parent = File.dirname(system_abs)
+  Dir.mktmpdir(".dot-untrack-", parent) do |work_dir|
+    staged = File.join(work_dir, "restored")
+    backup = File.join(work_dir, "original")
+    FileUtils.cp_r(repo_abs, staged, preserve: true)
+    merge_local_entries(system_abs, repo_abs, staged, matcher) if matcher
+
+    lines = File.readlines(map_path)
+    remaining_map = lines.each_with_index.filter_map { |line, i| line unless i == mapping.line - 1 }.join
+
+    File.rename(system_abs, backup)
+    begin
+      File.rename(staged, system_abs)
+      begin
+        replace_map(map_path, remaining_map)
+      rescue
+        File.rename(system_abs, staged)
+        File.rename(backup, system_abs)
+        raise
+      end
+    rescue
+      File.rename(backup, system_abs) if File.exist?(backup) || File.symlink?(backup)
+      raise
+    end
+
+    FileUtils.rm_rf(repo_abs)
+    puts "Untracked #{system_abs} (restored from #{mapping.repo_rel})"
+  end
+end
+
+def merge_local_entries(system_dir, repo_dir, staged_dir, matcher)
+  Find.find(system_dir) do |path|
+    next if path == system_dir
+    rel = Pathname.new(path).relative_path_from(Pathname.new(system_dir)).to_s
+    repo_path = File.join(repo_dir, rel)
+    staged_path = File.join(staged_dir, rel)
+    repo_exists = File.exist?(repo_path) || File.symlink?(repo_path)
+
+    if !matcher.match(rel) && repo_exists
+      next if File.directory?(repo_path) && !File.symlink?(repo_path)
+      Find.prune
+      next
+    end
+
+    raise "local path conflicts with repo content: #{path}" if File.exist?(staged_path) || File.symlink?(staged_path)
+    raise "local symlink points into DOTFILES: #{path}" if symlink_into?(path, repo_dir)
+    FileUtils.mkdir_p(File.dirname(staged_path))
+    FileUtils.cp_r(path, staged_path, preserve: true)
+    Find.prune if File.directory?(path) && !File.symlink?(path)
+  end
+end
+
+def symlink_into?(path, repo_dir)
+  paths = File.directory?(path) && !File.symlink?(path) ? Find.find(path).to_a : [path]
+  paths.any? do |p|
+    next false unless File.symlink?(p)
+    target = File.readlink(p)
+    target = File.expand_path(target, File.dirname(p)) unless Pathname.new(target).absolute?
+    target = clean(target)
+    target == repo_dir || target.start_with?(repo_dir + "/")
+  end
+end
+
+def absolute_symlink_into?(repo_path)
+  paths = File.directory?(repo_path) ? Find.find(repo_path).to_a : [repo_path]
+  paths.any? do |path|
+    next false unless File.symlink?(path)
+    target = File.readlink(path)
+    Pathname.new(target).absolute? && (clean(target) == repo_path || clean(target).start_with?(repo_path + "/"))
+  end
+end
+
+def replace_map(map_path, content)
+  Dir.mktmpdir(".dot-map-", File.dirname(map_path)) do |dir|
+    staged = File.join(dir, MAP_FILE)
+    File.write(staged, content)
+    File.chmod(File.stat(map_path).mode & 0777, staged)
+    File.rename(staged, map_path)
   end
 end
 
@@ -300,7 +413,7 @@ def compress_home(path)
 end
 
 def print_usage
-  puts "dot - minimalist dotfile manager\n\nusage:\n  dot track <file> [target_path|target_dir/]\n  dot link\n  dot list\n  dot sync\n\nEnvironment:\n  DOTFILES  Repository path (default: ~/.dotfiles)\n"
+  puts "dot - minimalist dotfile manager\n\nusage:\n  dot track <file> [target_path|target_dir/]\n  dot untrack <system_path|repo_path>\n  dot link\n  dot list\n  dot sync\n\nEnvironment:\n  DOTFILES  Repository path (default: ~/.dotfiles)\n"
 end
 
 if __FILE__ == $PROGRAM_NAME

@@ -43,6 +43,18 @@ dot track ~/.pi/agents pi/
 # stores it as $DOTFILES/pi/agents and maps that to ~/.pi/agents
 ```
 
+Restore a tracked file or directory to its original location and remove its
+mapping and repo copy:
+
+```bash
+dot untrack ~/.bashrc
+# or: dot untrack shell/.bashrc
+```
+
+`untrack` refuses to replace a changed link or overwrite local files. For
+directories with `.dot-local-ignore`, local files are kept when they do not
+conflict with files in the repo.
+
 Apply all mappings from `.dot.map`:
 
 ```bash

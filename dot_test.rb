@@ -241,6 +241,105 @@ class TestIntegrationTrackAndLink < Minitest::Test
   end
 end
 
+class TestIntegrationUntrack < Minitest::Test
+  def test_untrack_file_restores_original_and_preserves_other_mappings
+    Dir.mktmpdir do |root|
+      dotfiles = File.join(root, "dotfiles")
+      home = File.join(root, "home")
+      FileUtils.mkdir_p(home)
+      first = File.join(home, ".bashrc")
+      second = File.join(home, ".zshrc")
+      File.write(first, "bash settings\n")
+      File.write(second, "zsh settings\n")
+      cmd_track(dotfiles, [first, "shell/.bashrc"])
+      cmd_track(dotfiles, [second, "shell/.zshrc"])
+
+      cmd_untrack(dotfiles, [first])
+
+      assert_equal "bash settings\n", File.read(first)
+      refute File.symlink?(first)
+      refute File.exist?(File.join(dotfiles, "shell", ".bashrc"))
+      assert symlink_points_to?(second, File.join(dotfiles, "shell", ".zshrc"))
+      assert_equal ["shell/.zshrc"], parse_map(File.join(dotfiles, MAP_FILE), dotfiles).map(&:repo_rel)
+    end
+  end
+
+  def test_untrack_directory_by_repo_path
+    Dir.mktmpdir do |root|
+      dotfiles = File.join(root, "dotfiles")
+      source = File.join(root, "home", ".config", "nvim")
+      FileUtils.mkdir_p(source)
+      File.write(File.join(source, "init.lua"), "settings\n")
+      cmd_track(dotfiles, [source, "nvim"])
+
+      cmd_untrack(dotfiles, ["nvim"])
+
+      assert File.directory?(source)
+      refute File.symlink?(source)
+      assert_equal "settings\n", File.read(File.join(source, "init.lua"))
+      refute File.exist?(File.join(dotfiles, "nvim"))
+      assert_empty parse_map(File.join(dotfiles, MAP_FILE), dotfiles)
+    end
+  end
+
+  def test_untrack_ignored_directory_preserves_local_files
+    Dir.mktmpdir do |root|
+      dotfiles = File.join(root, "dotfiles")
+      source = File.join(root, "home", ".config", "nvim")
+      FileUtils.mkdir_p(source)
+      File.write(File.join(source, "init.lua"), "settings\n")
+      File.write(File.join(source, LOCAL_IGNORE), "^/README.*\n")
+      cmd_track(dotfiles, [source, "nvim"])
+      File.write(File.join(source, "local.txt"), "local\n")
+
+      cmd_untrack(dotfiles, [source])
+
+      assert_equal "settings\n", File.read(File.join(source, "init.lua"))
+      refute File.symlink?(File.join(source, "init.lua"))
+      assert_equal "local\n", File.read(File.join(source, "local.txt"))
+      assert File.exist?(File.join(source, LOCAL_IGNORE))
+      refute File.exist?(File.join(dotfiles, "nvim"))
+    end
+  end
+
+  def test_untrack_refuses_changed_link
+    Dir.mktmpdir do |root|
+      dotfiles = File.join(root, "dotfiles")
+      source = File.join(root, "home", ".bashrc")
+      FileUtils.mkdir_p(File.dirname(source))
+      File.write(source, "settings\n")
+      cmd_track(dotfiles, [source, "shell/.bashrc"])
+      File.delete(source)
+      File.write(source, "local changes\n")
+
+      assert_raises(RuntimeError) { cmd_untrack(dotfiles, [source]) }
+
+      assert_equal "local changes\n", File.read(source)
+      assert_equal "settings\n", File.read(File.join(dotfiles, "shell", ".bashrc"))
+      assert_equal 1, parse_map(File.join(dotfiles, MAP_FILE), dotfiles).length
+    end
+  end
+
+  def test_untrack_refuses_ignored_file_collision
+    Dir.mktmpdir do |root|
+      dotfiles = File.join(root, "dotfiles")
+      source = File.join(root, "home", ".config", "nvim")
+      FileUtils.mkdir_p(source)
+      File.write(File.join(source, "init.lua"), "settings\n")
+      File.write(File.join(source, "README.md"), "in repo\n")
+      File.write(File.join(source, LOCAL_IGNORE), "^/README.*\n")
+      cmd_track(dotfiles, [source, "nvim"])
+      File.write(File.join(source, "README.md"), "local\n")
+
+      assert_raises(RuntimeError) { cmd_untrack(dotfiles, [source]) }
+
+      assert_equal "local\n", File.read(File.join(source, "README.md"))
+      assert_equal "in repo\n", File.read(File.join(dotfiles, "nvim", "README.md"))
+      assert_equal 1, parse_map(File.join(dotfiles, MAP_FILE), dotfiles).length
+    end
+  end
+end
+
 class TestIntegrationTrackDirectoryAndLink < Minitest::Test
   def test_track_directory_and_link
     Dir.mktmpdir do |root|
